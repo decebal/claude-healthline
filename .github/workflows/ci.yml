@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    name: fmt / clippy / build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Smoke test (never-blank on garbage + empty stdin)
+        shell: bash
+        run: |
+          bin=target/release/claude-statusline
+          out=$(printf 'not json' | "$bin"); test -n "$out" || { echo "blank on garbage"; exit 1; }
+          out=$(printf '' | "$bin");        test -n "$out" || { echo "blank on empty";   exit 1; }
+          echo "never-blank OK"
