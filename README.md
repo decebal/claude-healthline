@@ -83,6 +83,21 @@ A status line command runs constantly, so claude-statusline is built to be borin
 - **Never hangs.** The `cn` lookup is wall-clock bounded to **≤ 800 ms** and cached per directory; the daily-cost scan is cached for **60 s** and only reads files modified today. Warm renders are **single-digit milliseconds**.
 - **Tiny.** **Two** dependencies (`serde`, `serde_json`); a **~470 KB** stripped release binary. No `git`, `jq`, or shell subprocesses on the hot path.
 
+## Narrow and split-screen terminals
+
+claude-statusline adapts to the width Claude Code reports in `COLUMNS`. When space runs out it degrades gracefully — dropping the lowest-value segments first, then compacting the cost cluster — so **model, context %, and cost never fall off screen** on a half-width pane.
+
+Removal order: `lines±` → `rate limit` → cost `burn`/`today` extras → `repo` → `git branch` → `task`. The three essentials are never dropped.
+
+| Terminal width | What stays |
+|---|---|
+| Full | all eight segments |
+| Wide split | drops lines±, then rate limit |
+| ~Half | cost compacts to session-only; drops repo + branch |
+| Very narrow | model · context % · cost |
+
+`COLUMNS` is exported by Claude Code v2.1.153+. If it's unset, the line renders in full (no truncation).
+
 ## How it compares
 
 claude-statusline optimizes for a lean, native, never-blank single binary with built-in cost math and chronis task tracking. Other excellent status lines trade that for more widgets or a config UI — pick what fits.
@@ -114,6 +129,9 @@ It still prints a valid one-line status and exits `0`. A missing or null field o
 
 ### Is the pricing table going to go stale?
 The built-in prices are a snapshot (August 2026). When Anthropic changes prices, edit the table or drop a `~/.claude/statusline-pricing.json` override — no recompile needed.
+
+### What happens on a small or split-screen terminal?
+It adapts to `COLUMNS` and drops the least-important segments first (lines±, then rate limit, then cost extras, then repo/branch/task), always keeping model, context %, and cost. So on a half-width pane you still see how full your context is and what the session costs.
 
 ## Contributing
 

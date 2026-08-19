@@ -674,8 +674,78 @@ fn round_pct(v: f64) -> i64 {
     v.round().clamp(0.0, 100.0) as i64
 }
 
+/// Visible width of the separator (` ▏ ` / ` | ` = 3 columns in both themes).
+const SEP_PLAIN: usize = 3;
+
+/// One rendered segment plus the metadata needed to shrink or drop it when the
+/// terminal is narrow.
+struct Seg {
+    kind: &'static str,
+    plain: usize,                     // visible width (excludes ANSI)
+    styled: String,                   // full, colored form
+    compact: Option<(usize, String)>, // optional narrower variant (width, styled)
+}
+
+impl Seg {
+    fn new(kind: &'static str, color: &str, glyph: &str, text: &str) -> Seg {
+        Seg {
+            kind,
+            plain: glyph.chars().count() + 1 + text.chars().count(),
+            styled: seg(color, glyph, text),
+            compact: None,
+        }
+    }
+}
+
+/// Terminal width Claude Code exports before running the status line
+/// (`COLUMNS`, since CC v2.1.153). `None` -> assume wide, never truncate.
+fn columns() -> Option<usize> {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&c| c > 0)
+}
+
+/// Join segments to fit `COLUMNS`, degrading gracefully: drop the lowest-value
+/// segments first, then strip the cost cluster's burn/today extras. Essentials
+/// — model, context %, and the session cost — are never dropped, so they stay
+/// in view on half-screen terminals (a wrap beats hiding the danger-zone cue).
+fn fit(mut segs: Vec<Seg>, sep: &str) -> String {
+    if let Some(cols) = columns() {
+        let width = |s: &[Seg]| {
+            s.iter().map(|x| x.plain).sum::<usize>() + SEP_PLAIN * s.len().saturating_sub(1)
+        };
+
+        // Each reduction applies only while still over budget, in value order.
+        for kind in ["lines", "rate"] {
+            if width(&segs) > cols {
+                segs.retain(|s| s.kind != kind);
+            }
+        }
+        if width(&segs) > cols {
+            for s in segs.iter_mut() {
+                if s.kind == "cost" {
+                    if let Some((pl, st)) = s.compact.take() {
+                        s.plain = pl;
+                        s.styled = st;
+                    }
+                }
+            }
+        }
+        for kind in ["repo", "branch", "task"] {
+            if width(&segs) > cols {
+                segs.retain(|s| s.kind != kind);
+            }
+        }
+    }
+    segs.into_iter()
+        .map(|s| s.styled)
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
 fn render(input: &Input, g: &Glyphs) -> String {
-    let mut segs: Vec<String> = Vec::new();
+    let mut segs: Vec<Seg> = Vec::new();
 
     // 1. MODEL
     let model_name = input
@@ -684,7 +754,7 @@ fn render(input: &Input, g: &Glyphs) -> String {
         .and_then(|m| m.display_name.as_deref())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("Claude");
-    segs.push(seg(DIM_CYAN, g.model, &clean(model_name, 24)));
+    segs.push(Seg::new("model", DIM_CYAN, g.model, &clean(model_name, 24)));
 
     // 2. REPO / DIR
     let repo_name = input
@@ -704,7 +774,7 @@ fn render(input: &Input, g: &Glyphs) -> String {
             dir.filter(|s| !s.trim().is_empty()).map(basename)
         });
     if let Some(name) = repo_name {
-        segs.push(seg(DIM, g.repo, &clean(&name, 24)));
+        segs.push(Seg::new("repo", DIM, g.repo, &clean(&name, 24)));
     }
 
     // 3. GIT BRANCH
@@ -713,7 +783,12 @@ fn render(input: &Input, g: &Glyphs) -> String {
         .as_ref()
         .and_then(|w| w.git_worktree.as_deref());
     if let Some(branch) = resolve_branch(input.cwd.as_deref(), git_worktree) {
-        segs.push(seg(DIM_MAGENTA, g.branch, &clean(&branch, 40)));
+        segs.push(Seg::new(
+            "branch",
+            DIM_MAGENTA,
+            g.branch,
+            &clean(&branch, 40),
+        ));
     }
 
     // 4. CONTEXT %
@@ -747,11 +822,11 @@ fn render(input: &Input, g: &Glyphs) -> String {
             (GREEN, String::new())
         };
         let text = format!("{prefix}{p}%");
-        segs.push(seg(color, g.context, &text));
+        segs.push(Seg::new("context", color, g.context, &text));
     } else if exceeds {
         // No percentage but we still want the Dumb Zone warning.
         let text = format!("{} 200k+", g.warning);
-        segs.push(seg(BOLD_RED, g.context, &text));
+        segs.push(Seg::new("context", BOLD_RED, g.context, &text));
     }
 
     // 5. COST
@@ -792,11 +867,20 @@ fn render(input: &Input, g: &Glyphs) -> String {
             format!("today ${d:.2}")
         });
     }
-    segs.push(seg(DIM_GREEN, g.cost, &parts.join(" \u{00B7} ")));
+    let full_text = parts.join(" \u{00B7} ");
+    let mut cost_seg = Seg::new("cost", DIM_GREEN, g.cost, &full_text);
+    if parts.len() > 1 {
+        // Narrow terminals collapse the cluster to just the session cost.
+        cost_seg.compact = Some((
+            g.cost.chars().count() + 1 + parts[0].chars().count(),
+            seg(DIM_GREEN, g.cost, &parts[0]),
+        ));
+    }
+    segs.push(cost_seg);
 
     // 6. TASK
     if let Some(id) = resolve_task_id(input.cwd.as_deref()) {
-        segs.push(seg(YELLOW, g.task, &id));
+        segs.push(Seg::new("task", YELLOW, g.task, &id));
     }
 
     // 7. RATE LIMITS
@@ -806,7 +890,7 @@ fn render(input: &Input, g: &Glyphs) -> String {
             if let Some(seven) = rl.seven_day.as_ref().and_then(|b| b.used_percentage) {
                 text.push_str(&format!(" \u{00B7} 7d {}%", round_pct(seven)));
             }
-            segs.push(seg(DIM, g.ratelimit, &text));
+            segs.push(Seg::new("rate", DIM, g.ratelimit, &text));
         }
     }
 
@@ -823,14 +907,20 @@ fn render(input: &Input, g: &Glyphs) -> String {
         .unwrap_or(0);
     if added != 0 || removed != 0 {
         // green +added  red -removed, glyph dim.
-        let text = format!(
+        let plain_text = format!("+{added} -{removed}");
+        let styled = format!(
             "{DIM}{}{RESET} {GREEN}+{added}{RESET} {RED}-{removed}{RESET}",
             g.lines
         );
-        segs.push(text);
+        segs.push(Seg {
+            kind: "lines",
+            plain: g.lines.chars().count() + 1 + plain_text.chars().count(),
+            styled,
+            compact: None,
+        });
     }
 
-    segs.join(&g.sep)
+    fit(segs, &g.sep)
 }
 
 /// Minimal never-blank fallback used when stdin is empty / not JSON.
