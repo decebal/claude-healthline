@@ -1,0 +1,27 @@
+[package]
+name = "claude-statusline"
+version = "0.1.0"
+edition = "2021"
+description = "A fast, never-blank Claude Code status line: powerline + Nerd-Font segments for model, git, context %, cost + burn rate + today's spend, and more."
+license = "MIT"
+repository = "https://github.com/decebal/claude-statusline"
+homepage = "https://github.com/decebal/claude-statusline"
+readme = "README.md"
+keywords = ["claude", "claude-code", "statusline", "cli", "powerline"]
+categories = ["command-line-utilities"]
+authors = ["decebal"]
+
+[[bin]]
+name = "claude-statusline"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
