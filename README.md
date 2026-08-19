@@ -7,8 +7,12 @@
 
 **claude-statusline is a fast, dependency-light Rust status line for [Claude Code](https://code.claude.com/docs/en/statusline).** It turns the JSON that Claude Code streams on stdin into a single powerline row showing your model, git branch, color-coded context-window usage, and live spend — session cost, per-hour burn rate, and today's total across every session — and it **never blanks, hangs, or panics**, whatever the session sends it.
 
-```
-󰄵 Opus 4.8 ▏ my-repo ▏  main ▏ 󰘦 42% ▏ 󰄗 $2.40 · ~$1.60/hr · today $12.40 ▏ 󰄹 t-fa00 ▏ 5h 24% · 7d 41% ▏ 󰷫 +156 -23
+![claude-statusline status bar preview](docs/statusline.svg)
+
+> The real status line prefixes each segment with a [Nerd Font](https://www.nerdfonts.com/) powerline glyph. Terminals without a Nerd Font (and GitHub itself) can't render those glyphs, so set `CLAUDE_STATUSLINE_ASCII=1` for the plain-text form:
+
+```text
+model Opus 4.8 | dir my-repo | git main | ctx 42% | cost $2.40 · ~$1.60/hr · today $12.40 | task t-fa00 | rate 5h 24% · 7d 41% | lines +156 -23
 ```
 
 ## What it does

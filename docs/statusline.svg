@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="46" viewBox="0 0 960 46" role="img" aria-label="claude-statusline status bar preview">
+  <rect x="0.5" y="0.5" width="959" height="45" rx="8" fill="#0d1117" stroke="#30363d"/>
+  <text x="18" y="29" xml:space="preserve" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" font-weight="500">
+    <tspan fill="#56b6c2">◈ Opus 4.8</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#8b949e">my-repo</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#c678dd"> main</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#98c379">▐ 42%</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#98c379">$2.40</tspan><tspan fill="#6e7681"> · ~$1.60/hr · today $12.40</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#e5c07b">✓ t-fa00</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#8b949e">5h 24% · 7d 41%</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#98c379">+156</tspan><tspan fill="#e06c75"> -23</tspan>
+  </text>
+</svg>
