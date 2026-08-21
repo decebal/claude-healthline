@@ -17,10 +17,11 @@ model Opus 4.8 | dir my-repo | git main | ctx 42% | cost $2.40 · ~$1.60/hr · t
 
 ## What it does
 
-claude-statusline renders up to nine segments in one line, each drawn only when its data is present. Context usage is color-coded green → yellow → **bold red** as you approach the limit, so the "danger zone" is visible at a glance.
+claude-statusline renders up to ten segments in one line, each drawn only when its data is present. Context usage is color-coded green → yellow → **bold red** as you approach the limit, so the "danger zone" is visible at a glance.
 
 - **Agent health** *(optional, first segment)* — a multi-dimensional readout (rule-adherence · truthfulness · task-success · stability) with a green/yellow/red verdict, instead of one vague "quality" number. Only shows when a health state file exists. See [Agent health score](#agent-health-score).
 - **Model** — the active model's display name.
+- **Caveman mode** *(optional)* — the active [caveman](https://github.com/JuliusBrussee/caveman) compression level and the tokens it has saved. Only shows when caveman is active. See [Caveman mode](#caveman-mode).
 - **Repo / dir** — repository name, else the working-directory basename.
 - **Git branch** — read straight from `.git/HEAD` with **no `git` subprocess**; handles worktrees and detached HEAD.
 - **Context %** — green `<50`, yellow `50–80`, **bold red `>80`** or when `exceeds_200k_tokens` trips.
@@ -91,6 +92,34 @@ Wire the hook to `PostToolUse` + `PostToolUseFailure` (see
 [docs/agent-health.md](docs/agent-health.md) for the full schema, thresholds,
 restart policy, and settings snippet).
 
+## Caveman mode
+
+[caveman](https://github.com/JuliusBrussee/caveman) compresses assistant prose to
+cut token spend, and ships a badge script for the status line. Running it meant
+choosing between that badge and this status line, so claude-statusline renders
+the badge itself — no `bash`, no `node`, no wrapper:
+
+```text
+model Opus 4.8 | ⛏ full · 114.9k saved | dir my-repo | git main | ctx 42% | cost $2.40
+```
+
+It reads the two files the plugin already writes under `$CLAUDE_CONFIG_DIR`
+(default `~/.claude`) — `.caveman-active` for the level, and
+`.caveman-statusline-suffix` for the savings figure `/caveman-stats` renders.
+Both are absent for everyone not running caveman, so the segment costs two
+`stat` calls and draws nothing.
+
+The savings figure only appears once `/caveman-stats` has run at least once —
+until then the badge is the level alone, never an invented number. The level
+`off` draws nothing: "not compressing" is not news.
+
+Both files are treated as hostile input, because their paths are predictable and
+a local attacker could plant one: a symlink is refused, the read is capped at 64
+bytes, the level must be on caveman's own whitelist, and the savings figure must
+parse as a whole token count (`114.9k`, `1.2M`) — so a planted
+`\x1b[31mPWNED\x1b[0m` renders nothing rather than repainting the terminal on
+every keystroke. Hide the segment with `CLAUDE_STATUSLINE_NO_CAVEMAN=1`.
+
 ## Configuration
 
 Every knob is an environment variable, so it composes cleanly with the `command` string.
@@ -101,6 +130,8 @@ Every knob is an environment variable, so it composes cleanly with the `command`
 | `CLAUDE_STATUSLINE_NO_DAILY=1` | Skip the transcript scan (drops the `today $…` figure) |
 | `CLAUDE_STATUSLINE_NO_HEALTH=1` | Hide the agent-health segment |
 | `CLAUDE_STATUSLINE_HEALTH_DIR=<path>` | Override the health state-file dir |
+| `CLAUDE_STATUSLINE_NO_CAVEMAN=1` | Hide the caveman-mode segment |
+| `CLAUDE_CONFIG_DIR=<path>` | Where the caveman flag files are read from (default `~/.claude`) |
 | `CLAUDE_STATUSLINE_CN_TTL=<secs>` | Chronis task cache TTL (default `8`) |
 | `CLAUDE_STATUSLINE_CN_BIN=<path>` | Explicit path to the `cn` binary |
 
@@ -133,7 +164,7 @@ claude-statusline optimizes for a lean, native, never-blank single binary with b
 
 | Project | Runtime | Focus |
 |---|---|---|
-| **claude-statusline** (this) | Rust (single binary) | Speed, never-blank guarantee, cost + burn + daily, chronis tasks, **agent-health readout** |
+| **claude-statusline** (this) | Rust (single binary) | Speed, never-blank guarantee, cost + burn + daily, chronis tasks, **agent-health readout**, caveman badge |
 | [ccstatusline](https://github.com/sirmalloc/ccstatusline) | TypeScript / Bun | Many widgets + TUI configurator |
 | [claude-powerline](https://github.com/chongdashu/claude-powerline) | Node | Plugin-native powerline themes |
 | [CCometixLine](https://github.com/Haleclipse/CCometixLine) | Rust | Powerline segments |
@@ -159,8 +190,11 @@ It still prints a valid one-line status and exits `0`. A missing or null field o
 ### Is the pricing table going to go stale?
 The built-in prices are a snapshot (August 2026). When Anthropic changes prices, edit the table or drop a `~/.claude/statusline-pricing.json` override — no recompile needed.
 
+### Do I have to drop caveman's badge script to use this?
+No — this renders it. Point `statusLine.command` at claude-statusline and the caveman level plus its savings figure appear as a segment, read from the same files the plugin already writes. Nothing to install, nothing to wrap, and `CLAUDE_STATUSLINE_NO_CAVEMAN=1` turns it off. See [Caveman mode](#caveman-mode).
+
 ### What happens on a small or split-screen terminal?
-It adapts to `COLUMNS` and drops the least-important segments first (lines±, then rate limit, then cost extras, then repo/branch/task), always keeping model, context %, and cost. So on a half-width pane you still see how full your context is and what the session costs.
+It adapts to `COLUMNS` and drops the least-important segments first (the caveman badge, then lines±, then rate limit, then cost extras, then repo/branch/task), always keeping model, context %, and cost. So on a half-width pane you still see how full your context is and what the session costs.
 
 ### What is the agent-health segment?
 An optional first segment reporting how the agent is doing across *separate* dimensions — rule-adherence, truthfulness, task-success, stability — with a green/yellow/red verdict, so you can tell instruction drift from hallucination from execution failure at a glance (not one vague "quality" number). It **only displays** scores from a per-session state file and **never invents them**: the bundled `claude-health-hook` fills the observable dimensions (stability + drift) from real tool outcomes; the rest render `–` until an evaluator or the agent writes them. Any safety/critical flag is a hard gate → red. Full schema, rubric, and hook wiring: [docs/agent-health.md](docs/agent-health.md).

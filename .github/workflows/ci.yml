@@ -28,6 +28,9 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Test
+        run: cargo test --all-targets
+
       - name: Build (release)
         run: cargo build --release
 
@@ -38,3 +41,19 @@ jobs:
           out=$(printf 'not json' | "$bin"); test -n "$out" || { echo "blank on garbage"; exit 1; }
           out=$(printf '' | "$bin");        test -n "$out" || { echo "blank on empty";   exit 1; }
           echo "never-blank OK"
+
+      - name: Smoke test (caveman badge on/off)
+        shell: bash
+        run: |
+          bin=target/release/claude-statusline
+          in='{"session_id":"ci","model":{"display_name":"Opus"}}'
+          cfg=$(mktemp -d)
+          out=$(printf '%s' "$in" | CLAUDE_CONFIG_DIR="$cfg" CLAUDE_STATUSLINE_ASCII=1 "$bin")
+          case "$out" in *cave*) echo "badge drawn with no flag file: $out"; exit 1;; esac
+          printf 'ultra' > "$cfg/.caveman-active"
+          printf '\xe2\x9b\x8f 114.9k' > "$cfg/.caveman-statusline-suffix"
+          out=$(printf '%s' "$in" | CLAUDE_CONFIG_DIR="$cfg" CLAUDE_STATUSLINE_ASCII=1 "$bin")
+          case "$out" in *"cave ultra · 114.9k saved"*) ;; *) echo "badge missing: $out"; exit 1;; esac
+          out=$(printf '%s' "$in" | CLAUDE_CONFIG_DIR="$cfg" CLAUDE_STATUSLINE_ASCII=1 CLAUDE_STATUSLINE_NO_CAVEMAN=1 "$bin")
+          case "$out" in *cave*) echo "opt-out ignored: $out"; exit 1;; esac
+          echo "caveman badge OK"
