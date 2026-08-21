@@ -108,11 +108,15 @@ const DIM_GREEN: &str = "\x1b[2;32m";
 const YELLOW: &str = "\x1b[33m";
 const BOLD_RED: &str = "\x1b[1;31m";
 const RED: &str = "\x1b[31m";
+/// The caveman plugin's own badge color, so the segment matches the badge users
+/// already know from `caveman-statusline.sh`.
+const ORANGE: &str = "\x1b[38;5;172m";
 
 /// Glyphs (Nerd Font v3, PUA). Codepoints documented in the report.
 struct Glyphs {
     health: &'static str,    // U+F0565 shield-check (agent health score)
     model: &'static str,     // U+F0135 robot
+    caveman: &'static str,   // U+26CF  pickaxe (caveman compression mode)
     repo: &'static str,      // U+F07B  folder
     branch: &'static str,    // U+E0A0  powerline branch
     context: &'static str,   // U+F0626 gauge
@@ -128,6 +132,7 @@ fn nerd_glyphs() -> Glyphs {
     Glyphs {
         health: "\u{F0565}",
         model: "\u{F0135}",
+        caveman: "\u{26CF}",
         repo: "\u{F07B}",
         branch: "\u{E0A0}",
         context: "\u{F0626}",
@@ -144,6 +149,7 @@ fn ascii_glyphs() -> Glyphs {
     Glyphs {
         health: "health",
         model: "model",
+        caveman: "cave",
         repo: "dir",
         branch: "git",
         context: "ctx",
@@ -667,6 +673,142 @@ fn daily_cost() -> Option<f64> {
 }
 
 // ---------------------------------------------------------------------------
+// Caveman mode badge — a DISPLAY over the caveman plugin's flag files.
+//
+// caveman (github.com/JuliusBrussee/caveman) compresses assistant prose and
+// writes two tiny files under $CLAUDE_CONFIG_DIR (default ~/.claude):
+//
+//   .caveman-active             the active level: lite | full | ultra | …
+//   .caveman-statusline-suffix  a pre-rendered savings string ("⛏ 114.9k")
+//
+// Both are read directly — no node, no subprocess — and both are treated as
+// hostile input: a symlink is refused (the flag path is predictable, so a local
+// attacker could point it at a secret and have the status line print its bytes
+// every keystroke), the read is byte-capped, the level must be on a whitelist,
+// and the savings string is reduced to the digits/scale characters it is
+// allowed to contain. Anything unexpected renders NOTHING rather than echoing
+// planted bytes. Disable the segment with CLAUDE_STATUSLINE_NO_CAVEMAN=1.
+// ---------------------------------------------------------------------------
+
+/// Levels the caveman plugin writes. `off` is deliberately absent: the plugin
+/// writes it when compression is INACTIVE, and a badge for "not on" is noise.
+const CAVEMAN_LEVELS: [&str; 10] = [
+    "lite",
+    "full",
+    "ultra",
+    "wenyan",
+    "wenyan-lite",
+    "wenyan-full",
+    "wenyan-ultra",
+    "commit",
+    "review",
+    "compress",
+];
+
+/// Longest flag-file read, in bytes. The files hold a word and a short number;
+/// anything longer is a planted file, not caveman's.
+const CAVEMAN_FLAG_MAX_BYTES: u64 = 64;
+
+/// `$CLAUDE_CONFIG_DIR`, else `$HOME/.claude` — the same resolution order the
+/// caveman hooks use to decide where to write.
+fn claude_config_dir() -> Option<PathBuf> {
+    if let Ok(d) = std::env::var("CLAUDE_CONFIG_DIR") {
+        if !d.trim().is_empty() {
+            return Some(PathBuf::from(d));
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    Some(Path::new(&home).join(".claude"))
+}
+
+/// Read a small flag file defensively: never follow a symlink, never read more
+/// than `CAVEMAN_FLAG_MAX_BYTES`, never return control characters.
+fn read_flag_file(path: &Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return None;
+    }
+    let f = std::fs::File::open(path).ok()?;
+    let mut buf = String::new();
+    f.take(CAVEMAN_FLAG_MAX_BYTES)
+        .read_to_string(&mut buf)
+        .ok()?;
+    let cleaned: String = buf.chars().filter(|c| !c.is_control()).collect();
+    let cleaned = cleaned.trim().to_string();
+    Some(cleaned).filter(|s| !s.is_empty())
+}
+
+/// The active caveman level, lowercased and whitelisted.
+fn caveman_level(dir: &Path) -> Option<String> {
+    let raw = read_flag_file(&dir.join(".caveman-active"))?.to_ascii_lowercase();
+    let level: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
+        .collect();
+    CAVEMAN_LEVELS
+        .iter()
+        .find(|m| **m == level)
+        .map(|m| (*m).to_string())
+}
+
+/// A humanized token count: digits, at most one decimal point, an optional
+/// `k`/`m`/`b` scale. Deliberately a WHOLE-token match rather than a character
+/// filter — filtering `\x1b[31mPWNED\x1b[0m` down to its digits and letters
+/// yields "31m0m", which looks like a figure and is not one.
+fn is_token_count(tok: &str) -> bool {
+    let chars: Vec<char> = tok.chars().collect();
+    if chars.is_empty() || chars.len() > 12 {
+        return false;
+    }
+    let digits = match chars.last() {
+        Some(c) if c.is_ascii_alphabetic() => {
+            if !matches!(c.to_ascii_lowercase(), 'k' | 'm' | 'b') {
+                return false;
+            }
+            &chars[..chars.len() - 1]
+        }
+        _ => &chars[..],
+    };
+    if digits.is_empty() || digits.last() == Some(&'.') {
+        return false;
+    }
+    let mut dots = 0;
+    for (i, c) in digits.iter().enumerate() {
+        if *c == '.' {
+            dots += 1;
+            if i == 0 || dots > 1 {
+                return false;
+            }
+        } else if !c.is_ascii_digit() {
+            return false;
+        }
+    }
+    true
+}
+
+/// The savings figure caveman pre-renders ("⛏ 114.9k" -> "114.9k"). The plugin
+/// only writes it once `/caveman-stats` has run, so its absence is normal and
+/// renders no number rather than a fabricated one. The pickaxe the plugin
+/// prepends is dropped: this segment draws its own glyph.
+fn caveman_savings(dir: &Path) -> Option<String> {
+    let raw = read_flag_file(&dir.join(".caveman-statusline-suffix"))?;
+    raw.split_whitespace()
+        .find(|t| t.starts_with(|c: char| c.is_ascii_digit()))
+        .filter(|t| is_token_count(t))
+        .map(|t| t.to_string())
+}
+
+/// `full` or `full · 114.9k saved` — `None` when caveman is not installed, not
+/// active, or the flag files are not what caveman writes.
+fn caveman_badge(dir: &Path) -> Option<String> {
+    let level = caveman_level(dir)?;
+    Some(match caveman_savings(dir) {
+        Some(saved) => format!("{level} \u{00B7} {saved} saved"),
+        None => level,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Agent health score — a DISPLAY over a per-session state file.
 //
 // The status line CANNOT itself measure instruction-following, truthfulness, or
@@ -963,14 +1105,22 @@ fn columns() -> Option<usize> {
 /// segments first, then strip the cost cluster's burn/today extras. Essentials
 /// — model, context %, and the session cost — are never dropped, so they stay
 /// in view on half-screen terminals (a wrap beats hiding the danger-zone cue).
-fn fit(mut segs: Vec<Seg>, sep: &str) -> String {
-    if let Some(cols) = columns() {
+fn fit(segs: Vec<Seg>, sep: &str) -> String {
+    fit_within(segs, sep, columns())
+}
+
+/// `fit` with the width passed in, so the degradation ORDER is testable without
+/// mutating the process-global `COLUMNS`.
+fn fit_within(mut segs: Vec<Seg>, sep: &str, cols: Option<usize>) -> String {
+    if let Some(cols) = cols {
         let width = |s: &[Seg]| {
             s.iter().map(|x| x.plain).sum::<usize>() + SEP_PLAIN * s.len().saturating_sub(1)
         };
 
         // Each reduction applies only while still over budget, in value order.
-        for kind in ["lines", "rate"] {
+        // The caveman badge goes first: it reports a mode the user chose and
+        // already knows, so it is the cheapest thing on the row to lose.
+        for kind in ["caveman", "lines", "rate"] {
             if width(&segs) > cols {
                 segs.retain(|s| s.kind != kind);
             }
@@ -1016,7 +1166,15 @@ fn render(input: &Input, g: &Glyphs) -> String {
         .unwrap_or("Claude");
     segs.push(Seg::new("model", DIM_CYAN, g.model, &clean(model_name, 24)));
 
-    // 2. REPO / DIR
+    // 2. CAVEMAN MODE — sits beside the model because it describes how that
+    // model is answering. Omitted entirely when caveman isn't active.
+    if !matches!(std::env::var("CLAUDE_STATUSLINE_NO_CAVEMAN"), Ok(v) if v == "1") {
+        if let Some(badge) = claude_config_dir().as_deref().and_then(caveman_badge) {
+            segs.push(Seg::new("caveman", ORANGE, g.caveman, &clean(&badge, 28)));
+        }
+    }
+
+    // 3. REPO / DIR
     let repo_name = input
         .workspace
         .as_ref()
@@ -1037,7 +1195,7 @@ fn render(input: &Input, g: &Glyphs) -> String {
         segs.push(Seg::new("repo", DIM, g.repo, &clean(&name, 24)));
     }
 
-    // 3. GIT BRANCH
+    // 4. GIT BRANCH
     let git_worktree = input
         .workspace
         .as_ref()
@@ -1051,7 +1209,7 @@ fn render(input: &Input, g: &Glyphs) -> String {
         ));
     }
 
-    // 4. CONTEXT %
+    // 5. CONTEXT %
     let exceeds = input.exceeds_200k_tokens.unwrap_or(false);
     let pct: Option<i64> = input
         .context_window
@@ -1089,7 +1247,7 @@ fn render(input: &Input, g: &Glyphs) -> String {
         segs.push(Seg::new("context", BOLD_RED, g.context, &text));
     }
 
-    // 5. COST
+    // 6. COST
     let mut cost = input
         .cost
         .as_ref()
@@ -1138,12 +1296,12 @@ fn render(input: &Input, g: &Glyphs) -> String {
     }
     segs.push(cost_seg);
 
-    // 6. TASK
+    // 7. TASK
     if let Some(id) = resolve_task_id(input.cwd.as_deref()) {
         segs.push(Seg::new("task", YELLOW, g.task, &id));
     }
 
-    // 7. RATE LIMITS
+    // 8. RATE LIMITS
     if let Some(rl) = input.rate_limits.as_ref() {
         if let Some(five) = rl.five_hour.as_ref().and_then(|b| b.used_percentage) {
             let mut text = format!("5h {}%", round_pct(five));
@@ -1154,7 +1312,7 @@ fn render(input: &Input, g: &Glyphs) -> String {
         }
     }
 
-    // 8. LINES ±
+    // 9. LINES ±
     let added = input
         .cost
         .as_ref()
@@ -1392,5 +1550,133 @@ mod tests {
         assert!(sg.styled.contains("R4.8"));
         assert!(sg.styled.contains("T–"));
         assert!(sg.styled.contains("S–"));
+    }
+
+    // -- caveman badge ------------------------------------------------------
+
+    /// A private scratch dir; the caveman readers take a dir, so no env var is
+    /// touched and the tests stay parallel-safe.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "claude-statusline-test-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn write_flag(dir: &Path, name: &str, contents: &str) {
+        std::fs::write(dir.join(name), contents).expect("write flag");
+    }
+
+    #[test]
+    fn no_flag_file_means_no_badge() {
+        let dir = scratch("caveman-absent");
+        assert_eq!(caveman_badge(&dir), None);
+    }
+
+    #[test]
+    fn level_alone_renders_without_a_savings_figure() {
+        let dir = scratch("caveman-level");
+        write_flag(&dir, ".caveman-active", "full");
+        assert_eq!(caveman_badge(&dir).as_deref(), Some("full"));
+    }
+
+    #[test]
+    fn savings_suffix_is_stripped_to_its_figure() {
+        let dir = scratch("caveman-savings");
+        write_flag(&dir, ".caveman-active", "ultra\n");
+        // The plugin prepends its own pickaxe; this segment draws one already.
+        write_flag(&dir, ".caveman-statusline-suffix", "⛏ 114.9k");
+        assert_eq!(caveman_badge(&dir).as_deref(), Some("ultra · 114.9k saved"));
+    }
+
+    #[test]
+    fn level_is_normalized_and_whitelisted() {
+        let dir = scratch("caveman-normalize");
+        write_flag(&dir, ".caveman-active", " WENYAN-ULTRA \n");
+        assert_eq!(caveman_badge(&dir).as_deref(), Some("wenyan-ultra"));
+
+        // Off is a real caveman level, but "not compressing" is not news.
+        write_flag(&dir, ".caveman-active", "off");
+        assert_eq!(caveman_badge(&dir), None);
+
+        // Anything not on the whitelist renders nothing rather than the bytes.
+        write_flag(&dir, ".caveman-active", "$(rm -rf ~)");
+        assert_eq!(caveman_badge(&dir), None);
+    }
+
+    #[test]
+    fn planted_escape_sequences_never_reach_the_terminal() {
+        let dir = scratch("caveman-escapes");
+        // A flag file carrying ANSI/OSC bytes must not paint the status line.
+        write_flag(&dir, ".caveman-active", "\x1b]8;;http://evil\x07full");
+        assert_eq!(caveman_badge(&dir), None);
+
+        write_flag(&dir, ".caveman-active", "full");
+        write_flag(&dir, ".caveman-statusline-suffix", "\x1b[31mPWNED\x1b[0m");
+        // Nothing in that string is a token count -> no figure, level survives.
+        assert_eq!(caveman_badge(&dir).as_deref(), Some("full"));
+    }
+
+    #[test]
+    fn only_a_whole_token_counts_as_a_figure() {
+        assert!(is_token_count("114.9k"));
+        assert!(is_token_count("512"));
+        assert!(is_token_count("1.2M"));
+        assert!(!is_token_count("31m0m")); // what a char-filter makes of ESC[31m
+        assert!(!is_token_count("1.2.3k"));
+        assert!(!is_token_count(".9k"));
+        assert!(!is_token_count("9."));
+        assert!(!is_token_count("114x"));
+        assert!(!is_token_count(""));
+    }
+
+    #[test]
+    fn oversized_flag_contents_are_rejected() {
+        let dir = scratch("caveman-oversize");
+        write_flag(&dir, ".caveman-active", "full");
+        write_flag(&dir, ".caveman-statusline-suffix", &"9".repeat(64));
+        assert_eq!(caveman_badge(&dir).as_deref(), Some("full"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_flag_is_refused() {
+        let dir = scratch("caveman-symlink");
+        let secret = dir.join("secret");
+        std::fs::write(&secret, "full").expect("secret");
+        std::os::unix::fs::symlink(&secret, dir.join(".caveman-active")).expect("symlink");
+        assert_eq!(caveman_badge(&dir), None);
+    }
+
+    fn narrow_row(g: &Glyphs) -> Vec<Seg> {
+        vec![
+            Seg::new("model", DIM_CYAN, g.model, "Opus 5"),
+            Seg::new("caveman", ORANGE, g.caveman, "full · 114.9k saved"),
+            Seg::new("lines", DIM, g.lines, "+40 -5"),
+        ]
+    }
+
+    #[test]
+    fn a_wide_terminal_keeps_the_caveman_badge() {
+        let g = ascii_glyphs();
+        let out = fit_within(narrow_row(&g), &g.sep, Some(200));
+        assert!(out.contains("cave full"));
+        assert!(out.contains("lines"));
+    }
+
+    #[test]
+    fn a_narrow_terminal_drops_the_caveman_badge_before_lines() {
+        let g = ascii_glyphs();
+        // Wide enough for model + lines, too narrow for all three.
+        let out = fit_within(narrow_row(&g), &g.sep, Some(30));
+        assert!(
+            !out.contains("cave "),
+            "caveman should be dropped first: {out}"
+        );
+        assert!(out.contains("lines"), "lines outrank the badge: {out}");
+        assert!(out.contains("Opus 5"));
     }
 }
