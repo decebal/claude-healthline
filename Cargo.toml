@@ -21,6 +21,12 @@ path = "src/main.rs"
 name = "claude-health-hook"
 path = "src/bin/claude-health-hook.rs"
 
+# Companion hook: fills the SUBJECTIVE dimensions (rules / truth / task) by
+# handing the last turn to a cheap judge model. Wire to Stop.
+[[bin]]
+name = "claude-health-report"
+path = "src/bin/claude-health-report.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

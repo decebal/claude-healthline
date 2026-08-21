@@ -120,20 +120,81 @@ Build/install both binaries (`cargo install --path .` installs
 }
 ```
 
-That lights up **stability + drift** automatically. The subjective dims stay `–`
-until you add an evaluator.
+That lights up **stability + drift** automatically. For the subjective three, add
+the `Stop` hook below.
 
 ## Writing the subjective dimensions
 
 Any process can write them — merge into the same file (don't clobber
-`stability`/`drift`, which the hook owns). Two common sources:
+`stability`/`drift`, which the hook owns). Two sources:
 
-1. **Agent self-report** — a `Stop` hook that asks a cheap judge to score the
-   last turn's rules/truth/task from the transcript and merges the result.
+1. **Agent self-report** — the bundled `claude-health-report`, below.
 2. **External evaluator** — an offline trajectory/faithfulness grader (tool-call
    accuracy + claim-level grounding) that writes scores + `reason` + `flag`.
 
-Minimal self-report merge (jq), keying off the status line's `session_id`:
+### The bundled self-report hook
+
+`claude-health-report` is a `Stop` hook. It takes the last turn, hands it to a
+cheap judge model, and merges the verdict into the same state file:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      { "matcher": "*", "hooks": [
+        { "type": "command", "command": "claude-health-report" } ] }
+    ]
+  }
+}
+```
+
+What it does, in order: find the last thing a **human** typed (Claude Code stamps
+those `origin.kind = "human"`; injected reminders and hook output ride the same
+`user` type and are not turn boundaries), collect everything since — assistant
+text, tool calls, and abbreviated tool **output** — cap it, and ask the judge for
+three scores.
+
+Four properties are deliberate:
+
+- **It never invents a dimension.** A judge that returns nothing usable writes
+  nothing, and that dimension keeps rendering `–`. The prompt tells the judge to
+  OMIT rather than guess, and the parser drops any dimension without a numeric
+  score. An unfinished turn scores no `task` rather than a bad one.
+- **It never blocks your turn.** The process that the hook runs parses the
+  payload and detaches in milliseconds; the judge call happens in a child.
+- **It cannot recurse.** The judge is itself a headless session, so its own
+  `Stop` hook runs this same binary — which exits immediately because the child
+  is marked with `CLAUDE_HEALTH_JUDGE=1`.
+- **The dimensions it owns are replaced, not accumulated.** A dimension the judge
+  declines to score this turn stops being displayed instead of lingering from an
+  older one. `stability` and `drift` are never touched.
+
+It grades an **excerpt**: the tail of the turn, with tool output abbreviated. The
+prompt says so, and says not to mark a claim ungrounded merely because the
+supporting output fell outside it — without that, every long turn scores badly on
+truth for a reason that is about the excerpt, not the agent.
+
+**Cost.** One judge call per turn — roughly **$0.02** on `haiku`, most of it the
+CLI's own prompt rather than your excerpt. Turn it off per-session with
+`CLAUDE_HEALTH_REPORT_DISABLE=1`, or point it at something cheaper with
+`CLAUDE_HEALTH_REPORT_BIN`.
+
+**A self-report is not an audit.** The judge reads a transcript the agent wrote,
+and a transcript can carry text aimed at the judge. The prompt frames the
+transcript as data and treats a request for a high score as evidence in itself —
+but for an adversarial setting, use an external evaluator. This is a smoke alarm.
+
+| Variable | Effect |
+|-----------|--------|
+| `CLAUDE_HEALTH_REPORT_DISABLE=1` | Skip the report entirely |
+| `CLAUDE_HEALTH_REPORT_MODEL` | Judge model (default `haiku`) |
+| `CLAUDE_HEALTH_REPORT_BIN` | Judge binary (default: `claude` on `PATH`) |
+| `CLAUDE_HEALTH_REPORT_TIMEOUT` | Judge wall-clock cap in seconds (default `120`, clamped 10–300) |
+| `CLAUDE_HEALTH_REPORT_MAX_CHARS` | Excerpt cap (default `6000`, clamped 500–60000) |
+
+### Writing them yourself
+
+Merge into the same file, keying off the status line's `session_id`:
 
 ```bash
 f="$HOME/.claude/agent-health/$SID.json"

@@ -82,15 +82,25 @@ R = rule adherence · T = truthfulness · S = task success · `!N` = drift ·
 `→next` = recommended action. Colour is the verdict (green/yellow/red).
 
 **It only displays; it never invents scores.** The status line reads a
-per-session state file (`~/.claude/agent-health/<session_id>.json`). The bundled
-`claude-health-hook` binary fills the **observable** dimensions (stability +
-drift) from real tool outcomes; the subjective ones (rules/truth/task) render `–`
-until an evaluator or the agent writes them. Any safety/critical flag is a **hard
-gate** that forces red regardless of the averages.
+per-session state file (`~/.claude/agent-health/<session_id>.json`), filled by
+two bundled hooks:
 
-Wire the hook to `PostToolUse` + `PostToolUseFailure` (see
-[docs/agent-health.md](docs/agent-health.md) for the full schema, thresholds,
-restart policy, and settings snippet).
+| Binary | Hook | Fills |
+|---|---|---|
+| `claude-health-hook` | `PostToolUse` + `PostToolUseFailure` | stability + drift, from real tool outcomes |
+| `claude-health-report` | `Stop` | rules / truth / task, from a cheap judge model |
+
+Anything a hook hasn't scored renders `–`, never a guess: the report omits a
+dimension the transcript can't support, and an unfinished turn scores no `task`
+rather than a bad one. Any safety/critical flag is a **hard gate** that forces
+red regardless of the averages.
+
+The report costs roughly **$0.02 per turn** (one `haiku` call), never blocks the
+turn — it detaches and grades in the background — and cannot recurse into itself.
+Skip it and the segment still works, with the subjective three showing `–`.
+
+Full schema, thresholds, restart policy, prompt design, and settings snippets:
+[docs/agent-health.md](docs/agent-health.md).
 
 ## Caveman mode
 
