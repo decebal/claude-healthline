@@ -5,7 +5,7 @@
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
 [![For Claude Code](https://img.shields.io/badge/for-Claude%20Code-6f42c1.svg)](https://code.claude.com/docs/en/statusline)
 
-**claude-statusline is a fast, dependency-light Rust status line for [Claude Code](https://code.claude.com/docs/en/statusline).** It turns the JSON that Claude Code streams on stdin into a single powerline row showing your model, git branch, color-coded context-window usage, and live spend — session cost, per-hour burn rate, and today's total across every session — and it **never blanks, hangs, or panics**, whatever the session sends it.
+**claude-statusline is a fast, dependency-light Rust status line for [Claude Code](https://code.claude.com/docs/en/statusline).** It turns the JSON that Claude Code streams on stdin into a single powerline row showing your model, git branch, color-coded context-window usage, live spend (session cost, per-hour burn rate, today's total across every session), and an optional multi-dimensional **[agent-health](#agent-health-score)** readout — and it **never blanks, hangs, or panics**, whatever the session sends it.
 
 ![claude-statusline status bar preview](docs/statusline.svg)
 
@@ -17,8 +17,9 @@ model Opus 4.8 | dir my-repo | git main | ctx 42% | cost $2.40 · ~$1.60/hr · t
 
 ## What it does
 
-claude-statusline renders eight segments in one line, each drawn only when its data is present. Context usage is color-coded green → yellow → **bold red** as you approach the limit, so the "danger zone" is visible at a glance.
+claude-statusline renders up to nine segments in one line, each drawn only when its data is present. Context usage is color-coded green → yellow → **bold red** as you approach the limit, so the "danger zone" is visible at a glance.
 
+- **Agent health** *(optional, first segment)* — a multi-dimensional readout (rule-adherence · truthfulness · task-success · stability) with a green/yellow/red verdict, instead of one vague "quality" number. Only shows when a health state file exists. See [Agent health score](#agent-health-score).
 - **Model** — the active model's display name.
 - **Repo / dir** — repository name, else the working-directory basename.
 - **Git branch** — read straight from `.git/HEAD` with **no `git` subprocess**; handles worktrees and detached HEAD.
@@ -132,7 +133,7 @@ claude-statusline optimizes for a lean, native, never-blank single binary with b
 
 | Project | Runtime | Focus |
 |---|---|---|
-| **claude-statusline** (this) | Rust (single binary) | Speed, never-blank guarantee, cost + burn + daily, chronis tasks |
+| **claude-statusline** (this) | Rust (single binary) | Speed, never-blank guarantee, cost + burn + daily, chronis tasks, **agent-health readout** |
 | [ccstatusline](https://github.com/sirmalloc/ccstatusline) | TypeScript / Bun | Many widgets + TUI configurator |
 | [claude-powerline](https://github.com/chongdashu/claude-powerline) | Node | Plugin-native powerline themes |
 | [CCometixLine](https://github.com/Haleclipse/CCometixLine) | Rust | Powerline segments |
@@ -160,6 +161,9 @@ The built-in prices are a snapshot (August 2026). When Anthropic changes prices,
 
 ### What happens on a small or split-screen terminal?
 It adapts to `COLUMNS` and drops the least-important segments first (lines±, then rate limit, then cost extras, then repo/branch/task), always keeping model, context %, and cost. So on a half-width pane you still see how full your context is and what the session costs.
+
+### What is the agent-health segment?
+An optional first segment reporting how the agent is doing across *separate* dimensions — rule-adherence, truthfulness, task-success, stability — with a green/yellow/red verdict, so you can tell instruction drift from hallucination from execution failure at a glance (not one vague "quality" number). It **only displays** scores from a per-session state file and **never invents them**: the bundled `claude-health-hook` fills the observable dimensions (stability + drift) from real tool outcomes; the rest render `–` until an evaluator or the agent writes them. Any safety/critical flag is a hard gate → red. Full schema, rubric, and hook wiring: [docs/agent-health.md](docs/agent-health.md).
 
 ## Contributing
 
