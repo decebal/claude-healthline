@@ -64,6 +64,32 @@ Claude Code transcripts record `costUSD: null` on every line, so **today's total
 }
 ```
 
+## Agent health score
+
+An optional first segment shows a compact, multi-dimensional **agent health**
+readout instead of one vague "quality" number — so you can tell instruction
+drift from hallucination from execution failure at a glance:
+
+```
+ R4.8 T4.7 S4.6          healthy   (green)
+ stab 4.2 !3 →repair     degraded  (yellow — a live tool-failure loop)
+ R– T4.4 S– →restart     restart   (red — hard gate)
+```
+
+R = rule adherence · T = truthfulness · S = task success · `!N` = drift ·
+`→next` = recommended action. Colour is the verdict (green/yellow/red).
+
+**It only displays; it never invents scores.** The status line reads a
+per-session state file (`~/.claude/agent-health/<session_id>.json`). The bundled
+`claude-health-hook` binary fills the **observable** dimensions (stability +
+drift) from real tool outcomes; the subjective ones (rules/truth/task) render `–`
+until an evaluator or the agent writes them. Any safety/critical flag is a **hard
+gate** that forces red regardless of the averages.
+
+Wire the hook to `PostToolUse` + `PostToolUseFailure` (see
+[docs/agent-health.md](docs/agent-health.md) for the full schema, thresholds,
+restart policy, and settings snippet).
+
 ## Configuration
 
 Every knob is an environment variable, so it composes cleanly with the `command` string.
@@ -72,6 +98,8 @@ Every knob is an environment variable, so it composes cleanly with the `command`
 |---|---|
 | `CLAUDE_STATUSLINE_ASCII=1` (or `NERD_FONT=0`) | Plain-text labels instead of Nerd-Font glyphs (colors kept) |
 | `CLAUDE_STATUSLINE_NO_DAILY=1` | Skip the transcript scan (drops the `today $…` figure) |
+| `CLAUDE_STATUSLINE_NO_HEALTH=1` | Hide the agent-health segment |
+| `CLAUDE_STATUSLINE_HEALTH_DIR=<path>` | Override the health state-file dir |
 | `CLAUDE_STATUSLINE_CN_TTL=<secs>` | Chronis task cache TTL (default `8`) |
 | `CLAUDE_STATUSLINE_CN_BIN=<path>` | Explicit path to the `cn` binary |
 

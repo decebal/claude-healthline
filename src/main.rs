@@ -22,6 +22,8 @@ struct Input {
     #[serde(default)]
     cwd: Option<String>,
     #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
     model: Option<Model>,
     #[serde(default)]
     workspace: Option<Workspace>,
@@ -109,6 +111,7 @@ const RED: &str = "\x1b[31m";
 
 /// Glyphs (Nerd Font v3, PUA). Codepoints documented in the report.
 struct Glyphs {
+    health: &'static str,    // U+F0565 shield-check (agent health score)
     model: &'static str,     // U+F0135 robot
     repo: &'static str,      // U+F07B  folder
     branch: &'static str,    // U+E0A0  powerline branch
@@ -123,6 +126,7 @@ struct Glyphs {
 
 fn nerd_glyphs() -> Glyphs {
     Glyphs {
+        health: "\u{F0565}",
         model: "\u{F0135}",
         repo: "\u{F07B}",
         branch: "\u{E0A0}",
@@ -138,6 +142,7 @@ fn nerd_glyphs() -> Glyphs {
 
 fn ascii_glyphs() -> Glyphs {
     Glyphs {
+        health: "health",
         model: "model",
         repo: "dir",
         branch: "git",
@@ -662,6 +667,254 @@ fn daily_cost() -> Option<f64> {
 }
 
 // ---------------------------------------------------------------------------
+// Agent health score — a DISPLAY over a per-session state file.
+//
+// The status line CANNOT itself measure instruction-following, truthfulness, or
+// task success — so it never invents them. It renders whatever a writer has put
+// in ~/.claude/agent-health/<session_id>.json (override the dir with
+// CLAUDE_STATUSLINE_HEALTH_DIR). The bundled `claude-health-hook` binary writes
+// only the OBSERVABLE dimensions (stability + drift, from real tool outcomes);
+// the subjective dimensions (rules/truth/task) render `–` until an evaluator or
+// the agent itself writes them. Disable the segment with
+// CLAUDE_STATUSLINE_NO_HEALTH=1.
+//
+// State file schema (every field optional):
+//   { "rules":{"score":4.8,"reason":"...","flag":false},
+//     "truth":{...}, "task":{...}, "stability":{...},
+//     "drift":0, "safety_flag":false,
+//     "next":"continue|repair|review|restart",
+//     "state":"healthy|degraded|restart",   // optional explicit override
+//     "updated_at": 1690000000 }
+// Scores are 1–5 (the rubric). A single `flag`/`safety_flag` is a HARD GATE:
+// it forces RESTART regardless of how high the averages are.
+// ---------------------------------------------------------------------------
+
+const HEALTH_MAX_AGE_SECS: u64 = 12 * 3600;
+/// A sustained loop (this many consecutive failing tool calls) is a hard gate.
+const DRIFT_RESTART: i64 = 5;
+
+/// Per-dimension `(healthy_bar, restart_floor)` on the 1–5 rubric, mapped from
+/// the operator policy's 0–1 thresholds. Below `healthy_bar` is Degraded; below
+/// `restart_floor` is Restart. Rules/Truth demand ≥0.95 to stay green and Truth
+/// falls to Restart under 0.90 (fabrication territory); Task is allowed a lower
+/// 0.90 green bar. Stability has no hard restart floor — a *loop* (drift) is the
+/// restart trigger, a merely low stability score is only Degraded.
+fn dim_thresholds(name: &str) -> (f64, f64) {
+    match name {
+        "rules" => (4.75, 4.25),   // ≥0.95 green, <0.85 restart
+        "truth" => (4.75, 4.50),   // ≥0.95 green, <0.90 restart
+        "task" => (4.50, 4.25),    // ≥0.90 green, <0.85 restart
+        _ /* stability */ => (4.75, 1.0), // ≥0.95 green, never hard-gates alone
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct HealthState {
+    #[serde(default)]
+    rules: Option<HealthDim>,
+    #[serde(default)]
+    truth: Option<HealthDim>,
+    #[serde(default)]
+    task: Option<HealthDim>,
+    #[serde(default)]
+    stability: Option<HealthDim>,
+    #[serde(default)]
+    drift: Option<i64>,
+    #[serde(default)]
+    safety_flag: Option<bool>,
+    #[serde(default)]
+    next: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct HealthDim {
+    #[serde(default)]
+    score: Option<f64>,
+    #[serde(default)]
+    flag: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthLevel {
+    Healthy,
+    Degraded,
+    Restart,
+}
+
+impl HealthDim {
+    /// A finite score clamped to the 1–5 rubric, if present.
+    fn clamped(&self) -> Option<f64> {
+        self.score
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(1.0, 5.0))
+    }
+    fn is_flagged(&self) -> bool {
+        self.flag.unwrap_or(false)
+    }
+}
+
+fn health_dir() -> Option<PathBuf> {
+    if let Ok(d) = std::env::var("CLAUDE_STATUSLINE_HEALTH_DIR") {
+        if !d.trim().is_empty() {
+            return Some(PathBuf::from(d));
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    Some(Path::new(&home).join(".claude/agent-health"))
+}
+
+/// Read + parse the health state for this session, ignoring a file older than
+/// `HEALTH_MAX_AGE_SECS` (so a reused/abandoned session id can't show stale data).
+fn read_health(session_id: Option<&str>) -> Option<HealthState> {
+    if matches!(std::env::var("CLAUDE_STATUSLINE_NO_HEALTH"), Ok(v) if v == "1") {
+        return None;
+    }
+    let sid = session_id?.trim();
+    if sid.is_empty()
+        || !sid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None; // guard the path join against traversal / junk
+    }
+    let path = health_dir()?.join(format!("{sid}.json"));
+    let fresh = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|mt| SystemTime::now().duration_since(mt).ok())
+        .map(|age| age < Duration::from_secs(HEALTH_MAX_AGE_SECS))
+        .unwrap_or(false);
+    if !fresh {
+        return None;
+    }
+    let raw = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str::<HealthState>(&raw).ok()
+}
+
+/// Derive the health level. HARD GATE first: any dimension flag or the safety
+/// flag forces `Restart` — a high average must never conceal a critical
+/// violation. An explicit `state` in the file wins for Restart/Degraded but can
+/// never *upgrade* past what the hard gate or the scores warrant.
+fn derive_level(h: &HealthState) -> HealthLevel {
+    let named = [
+        ("rules", &h.rules),
+        ("truth", &h.truth),
+        ("task", &h.task),
+        ("stability", &h.stability),
+    ];
+    let drift = h.drift.unwrap_or(0);
+
+    // HARD GATE: any flag, the safety flag, a sustained loop, or a per-dimension
+    // score under its restart floor forces Restart — a high average must never
+    // conceal a critical violation.
+    let hard_gate = h.safety_flag.unwrap_or(false)
+        || named
+            .iter()
+            .any(|(_, d)| d.as_ref().is_some_and(|x| x.is_flagged()))
+        || drift >= DRIFT_RESTART
+        || h.state.as_deref() == Some("restart")
+        || h.next.as_deref() == Some("restart")
+        || named.iter().any(|(name, d)| {
+            d.as_ref()
+                .and_then(|x| x.clamped())
+                .is_some_and(|s| s < dim_thresholds(name).1)
+        });
+    if hard_gate {
+        return HealthLevel::Restart;
+    }
+
+    // Healthy iff every PRESENT dimension clears its green bar, no drift, and no
+    // explicit downgrade. An explicit `state` can only downgrade — never upgrade
+    // past what the scores/flags warrant.
+    let all_green = named.iter().all(|(name, d)| {
+        d.as_ref()
+            .and_then(|x| x.clamped())
+            .is_none_or(|s| s >= dim_thresholds(name).0)
+    });
+    if all_green && drift == 0 && h.state.as_deref() != Some("degraded") {
+        HealthLevel::Healthy
+    } else {
+        HealthLevel::Degraded
+    }
+}
+
+fn health_color(level: HealthLevel) -> &'static str {
+    match level {
+        HealthLevel::Healthy => GREEN,
+        HealthLevel::Degraded => YELLOW,
+        HealthLevel::Restart => BOLD_RED,
+    }
+}
+
+fn default_next(level: HealthLevel) -> &'static str {
+    match level {
+        HealthLevel::Healthy => "continue",
+        HealthLevel::Degraded => "repair",
+        HealthLevel::Restart => "restart",
+    }
+}
+
+/// One rubric score as `4.8`, or `–` when absent.
+fn fmt_score(d: Option<&HealthDim>) -> String {
+    match d.and_then(|x| x.clamped()) {
+        Some(v) => format!("{v:.1}"),
+        None => "–".to_string(),
+    }
+}
+
+/// Build the health segment, or `None` when there is nothing to show. `core` is
+/// the always-kept part (`R4.8 T4.7 S4.6`); the full form appends drift + next.
+fn render_health(h: &HealthState, g: &Glyphs) -> Option<Seg> {
+    let level = derive_level(h);
+    let color = health_color(level);
+
+    // Core: the three judged dimensions. If none are present but stability is,
+    // show stability alone so an observed-only (hook-fed) session still reads.
+    let core = if h.rules.is_some() || h.truth.is_some() || h.task.is_some() {
+        format!(
+            "R{} T{} S{}",
+            fmt_score(h.rules.as_ref()),
+            fmt_score(h.truth.as_ref()),
+            fmt_score(h.task.as_ref())
+        )
+    } else if let Some(s) = h.stability.as_ref().and_then(|x| x.clamped()) {
+        format!("stab {s:.1}")
+    } else if level == HealthLevel::Restart {
+        // Flag-only state with no scores: still surface the restart cue.
+        "check".to_string()
+    } else {
+        return None;
+    };
+
+    // Suffixes (dropped in the compact variant).
+    let mut full = core.clone();
+    let drift = h.drift.unwrap_or(0);
+    if drift > 0 {
+        full.push_str(&format!(" {}{drift}", g.warning));
+    }
+    let next = h
+        .next
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default_next(level));
+    if next != "continue" {
+        full.push_str(&format!(" \u{2192}{}", clean(next, 10)));
+    }
+
+    let mut sg = Seg::new("health", color, g.health, &full);
+    if full != core {
+        sg.compact = Some((
+            g.health.chars().count() + 1 + core.chars().count(),
+            seg(color, g.health, &core),
+        ));
+    }
+    Some(sg)
+}
+
+// ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
 
@@ -724,7 +977,7 @@ fn fit(mut segs: Vec<Seg>, sep: &str) -> String {
         }
         if width(&segs) > cols {
             for s in segs.iter_mut() {
-                if s.kind == "cost" {
+                if s.kind == "cost" || s.kind == "health" {
                     if let Some((pl, st)) = s.compact.take() {
                         s.plain = pl;
                         s.styled = st;
@@ -746,6 +999,13 @@ fn fit(mut segs: Vec<Seg>, sep: &str) -> String {
 
 fn render(input: &Input, g: &Glyphs) -> String {
     let mut segs: Vec<Seg> = Vec::new();
+
+    // 0. AGENT HEALTH — headline; highest value, never dropped (only compacted).
+    if let Some(h) = read_health(input.session_id.as_deref()) {
+        if let Some(hseg) = render_health(&h, g) {
+            segs.push(hseg);
+        }
+    }
 
     // 1. MODEL
     let model_name = input
@@ -973,4 +1233,164 @@ fn main() {
         line
     };
     println!("{line}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dim(score: Option<f64>, flag: bool) -> HealthDim {
+        HealthDim {
+            score,
+            flag: Some(flag),
+        }
+    }
+
+    #[test]
+    fn all_high_scores_are_healthy() {
+        let h = HealthState {
+            rules: Some(dim(Some(4.8), false)),
+            truth: Some(dim(Some(4.9), false)),
+            task: Some(dim(Some(4.75), false)),
+            ..Default::default()
+        };
+        assert_eq!(derive_level(&h), HealthLevel::Healthy);
+    }
+
+    #[test]
+    fn one_dim_below_nominal_is_degraded() {
+        let h = HealthState {
+            rules: Some(dim(Some(4.9), false)),
+            truth: Some(dim(Some(4.6), false)), // < 4.75
+            ..Default::default()
+        };
+        assert_eq!(derive_level(&h), HealthLevel::Degraded);
+    }
+
+    #[test]
+    fn safety_flag_is_a_hard_gate_over_perfect_scores() {
+        let h = HealthState {
+            rules: Some(dim(Some(5.0), false)),
+            truth: Some(dim(Some(5.0), false)),
+            task: Some(dim(Some(5.0), false)),
+            safety_flag: Some(true),
+            ..Default::default()
+        };
+        // A perfect average must NEVER conceal a critical flag.
+        assert_eq!(derive_level(&h), HealthLevel::Restart);
+    }
+
+    #[test]
+    fn any_dimension_flag_forces_restart() {
+        let h = HealthState {
+            rules: Some(dim(Some(5.0), false)),
+            truth: Some(dim(Some(5.0), true)), // fabrication flag
+            ..Default::default()
+        };
+        assert_eq!(derive_level(&h), HealthLevel::Restart);
+    }
+
+    #[test]
+    fn explicit_state_can_downgrade_but_not_upgrade() {
+        // File says "degraded" though scores are perfect -> honor the downgrade.
+        let down = HealthState {
+            rules: Some(dim(Some(5.0), false)),
+            state: Some("degraded".into()),
+            ..Default::default()
+        };
+        assert_eq!(derive_level(&down), HealthLevel::Degraded);
+
+        // File says "healthy" but a dim is below its green bar (yet above the
+        // restart floor) -> scores still win, capped at Degraded.
+        let up = HealthState {
+            rules: Some(dim(Some(4.6), false)), // 4.25 <= 4.6 < 4.75
+            state: Some("healthy".into()),
+            ..Default::default()
+        };
+        assert_eq!(derive_level(&up), HealthLevel::Degraded);
+    }
+
+    #[test]
+    fn per_dimension_thresholds_differ() {
+        // Task has a lower green bar (4.50): 4.6 task is Healthy.
+        let task_ok = HealthState {
+            task: Some(dim(Some(4.6), false)),
+            ..Default::default()
+        };
+        assert_eq!(derive_level(&task_ok), HealthLevel::Healthy);
+        // The same 4.6 on Truth is only Degraded (green bar 4.75).
+        let truth_soft = HealthState {
+            truth: Some(dim(Some(4.6), false)),
+            ..Default::default()
+        };
+        assert_eq!(derive_level(&truth_soft), HealthLevel::Degraded);
+        // Truth under 4.50 (its restart floor / ~0.90) is fabrication territory.
+        let truth_hard = HealthState {
+            truth: Some(dim(Some(4.4), false)),
+            ..Default::default()
+        };
+        assert_eq!(derive_level(&truth_hard), HealthLevel::Restart);
+    }
+
+    #[test]
+    fn a_live_loop_degrades_then_forces_restart() {
+        let degraded = HealthState {
+            stability: Some(dim(Some(5.0), false)),
+            drift: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(derive_level(&degraded), HealthLevel::Degraded);
+
+        let restart = HealthState {
+            stability: Some(dim(Some(5.0), false)),
+            drift: Some(DRIFT_RESTART),
+            ..Default::default()
+        };
+        assert_eq!(derive_level(&restart), HealthLevel::Restart);
+    }
+
+    #[test]
+    fn empty_state_with_no_signals_is_healthy_but_renders_nothing() {
+        let h = HealthState::default();
+        assert_eq!(derive_level(&h), HealthLevel::Healthy);
+        assert!(render_health(&h, &ascii_glyphs()).is_none());
+    }
+
+    #[test]
+    fn scores_are_clamped_to_the_rubric() {
+        assert_eq!(fmt_score(Some(&dim(Some(9.9), false))), "5.0");
+        assert_eq!(fmt_score(Some(&dim(Some(-3.0), false))), "1.0");
+        assert_eq!(fmt_score(Some(&dim(None, false))), "–");
+        assert_eq!(fmt_score(None), "–");
+        assert_eq!(fmt_score(Some(&dim(Some(f64::NAN), false))), "–");
+    }
+
+    #[test]
+    fn stability_only_renders_without_the_subjective_dims() {
+        let h = HealthState {
+            stability: Some(dim(Some(4.2), false)),
+            drift: Some(2),
+            ..Default::default()
+        };
+        let sg = render_health(&h, &ascii_glyphs()).expect("segment");
+        assert!(sg.styled.contains("stab 4.2"));
+        assert!(sg.styled.contains('2')); // drift surfaced
+                                          // degraded (4.2 < 4.75) -> yellow
+        assert!(sg.styled.contains(YELLOW));
+        // compact drops the drift suffix, keeps the core
+        let (_, compact) = sg.compact.expect("compact");
+        assert!(compact.contains("stab 4.2"));
+    }
+
+    #[test]
+    fn subjective_dims_render_dashes_when_absent() {
+        let h = HealthState {
+            rules: Some(dim(Some(4.8), false)),
+            ..Default::default()
+        };
+        let sg = render_health(&h, &ascii_glyphs()).expect("segment");
+        assert!(sg.styled.contains("R4.8"));
+        assert!(sg.styled.contains("T–"));
+        assert!(sg.styled.contains("S–"));
+    }
 }
