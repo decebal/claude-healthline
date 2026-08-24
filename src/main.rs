@@ -1,4 +1,4 @@
-//! claude-statusline — a Claude Code status line command.
+//! claude-healthline — a Claude Code status line command.
 //!
 //! Reads a JSON object on STDIN, prints ONE line to STDOUT with ANSI color +
 //! Nerd-Font glyphs, and always exits 0.
@@ -169,7 +169,7 @@ fn ascii_glyphs() -> Glyphs {
 }
 
 fn ascii_mode() -> bool {
-    match std::env::var("CLAUDE_STATUSLINE_ASCII") {
+    match std::env::var("CLAUDE_HEALTHLINE_ASCII") {
         Ok(v) if v == "1" => return true,
         _ => {}
     }
@@ -292,19 +292,19 @@ fn hash_cwd(cwd: &str) -> u64 {
 }
 
 fn cn_ttl() -> Duration {
-    let secs = std::env::var("CLAUDE_STATUSLINE_CN_TTL")
+    let secs = std::env::var("CLAUDE_HEALTHLINE_CN_TTL")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(DEFAULT_CN_TTL_SECS);
     Duration::from_secs(secs)
 }
 
-/// Resolve the chronis (`cn`) binary: an explicit `CLAUDE_STATUSLINE_CN_BIN`
+/// Resolve the chronis (`cn`) binary: an explicit `CLAUDE_HEALTHLINE_CN_BIN`
 /// override, else the conventional cargo bin under `$HOME` (present on most
 /// Rust setups), else bare `cn` on `PATH`. The task segment simply omits itself
 /// if none of these can run.
 fn cn_bin() -> String {
-    if let Ok(b) = std::env::var("CLAUDE_STATUSLINE_CN_BIN") {
+    if let Ok(b) = std::env::var("CLAUDE_HEALTHLINE_CN_BIN") {
         if !b.trim().is_empty() {
             return b;
         }
@@ -319,7 +319,7 @@ fn cn_bin() -> String {
 }
 
 fn cache_path(cwd: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("claude-statusline-cn-{:016x}", hash_cwd(cwd)))
+    std::env::temp_dir().join(format!("claude-healthline-cn-{:016x}", hash_cwd(cwd)))
 }
 
 /// Extract the first `t-<...>` token from cn's TOON output, skipping the header.
@@ -469,7 +469,7 @@ fn read_cache(path: &Path) -> Option<String> {
 // derived from token usage x per-model pricing. Prices are per MILLION tokens
 // (Aug 2026); cache rates follow Anthropic's ratios (read = 0.10x input,
 // 5-min write = 1.25x input, 1-hour write = 2.0x input). Override the built-in
-// table with ~/.claude/statusline-pricing.json:
+// table with ~/.claude/healthline-pricing.json:
 //   { "claude-opus-4-8": { "input": 5.0, "output": 25.0 }, ... }
 // ---------------------------------------------------------------------------
 
@@ -520,7 +520,7 @@ fn price_for(model: &str, overrides: &Option<Value>) -> Option<Price> {
 
 fn load_price_overrides() -> Option<Value> {
     let home = std::env::var("HOME").ok()?;
-    let path = Path::new(&home).join(".claude/statusline-pricing.json");
+    let path = Path::new(&home).join(".claude/healthline-pricing.json");
     let raw = std::fs::read_to_string(path).ok()?;
     serde_json::from_str::<Value>(&raw).ok()
 }
@@ -653,13 +653,13 @@ fn daily_cost_uncached(today: &str) -> Option<f64> {
 }
 
 /// Cached wrapper: recompute today's cost at most every `DAILY_TTL_SECS`.
-/// Disable entirely with `CLAUDE_STATUSLINE_NO_DAILY=1`.
+/// Disable entirely with `CLAUDE_HEALTHLINE_NO_DAILY=1`.
 fn daily_cost() -> Option<f64> {
-    if matches!(std::env::var("CLAUDE_STATUSLINE_NO_DAILY"), Ok(v) if v == "1") {
+    if matches!(std::env::var("CLAUDE_HEALTHLINE_NO_DAILY"), Ok(v) if v == "1") {
         return None;
     }
     let today = today_utc();
-    let path = std::env::temp_dir().join(format!("claude-statusline-daily-{today}"));
+    let path = std::env::temp_dir().join(format!("claude-healthline-daily-{today}"));
 
     let fresh = std::fs::metadata(&path)
         .ok()
@@ -693,7 +693,7 @@ fn daily_cost() -> Option<f64> {
 // every keystroke), the read is byte-capped, the level must be on a whitelist,
 // and the savings string is reduced to the digits/scale characters it is
 // allowed to contain. Anything unexpected renders NOTHING rather than echoing
-// planted bytes. Disable the segment with CLAUDE_STATUSLINE_NO_CAVEMAN=1.
+// planted bytes. Disable the segment with CLAUDE_HEALTHLINE_NO_CAVEMAN=1.
 // ---------------------------------------------------------------------------
 
 /// Levels the caveman plugin writes. `off` is deliberately absent: the plugin
@@ -820,11 +820,11 @@ fn caveman_badge(dir: &Path) -> Option<String> {
 // The status line CANNOT itself measure instruction-following, truthfulness, or
 // task success — so it never invents them. It renders whatever a writer has put
 // in ~/.claude/agent-health/<session_id>.json (override the dir with
-// CLAUDE_STATUSLINE_HEALTH_DIR). The bundled `claude-health-hook` binary writes
+// CLAUDE_HEALTHLINE_HEALTH_DIR). The bundled `claude-health-hook` binary writes
 // only the OBSERVABLE dimensions (stability + drift, from real tool outcomes);
 // the subjective dimensions (rules/truth/task) render `–` until an evaluator or
 // the agent itself writes them. Disable the segment with
-// CLAUDE_STATUSLINE_NO_HEALTH=1.
+// CLAUDE_HEALTHLINE_NO_HEALTH=1.
 //
 // State file schema (every field optional):
 //   { "rules":{"score":4.8,"reason":"...","flag":false},
@@ -904,7 +904,7 @@ impl HealthDim {
 }
 
 fn health_dir() -> Option<PathBuf> {
-    if let Ok(d) = std::env::var("CLAUDE_STATUSLINE_HEALTH_DIR") {
+    if let Ok(d) = std::env::var("CLAUDE_HEALTHLINE_HEALTH_DIR") {
         if !d.trim().is_empty() {
             return Some(PathBuf::from(d));
         }
@@ -916,7 +916,7 @@ fn health_dir() -> Option<PathBuf> {
 /// Read + parse the health state for this session, ignoring a file older than
 /// `HEALTH_MAX_AGE_SECS` (so a reused/abandoned session id can't show stale data).
 fn read_health(session_id: Option<&str>) -> Option<HealthState> {
-    if matches!(std::env::var("CLAUDE_STATUSLINE_NO_HEALTH"), Ok(v) if v == "1") {
+    if matches!(std::env::var("CLAUDE_HEALTHLINE_NO_HEALTH"), Ok(v) if v == "1") {
         return None;
     }
     let sid = session_id?.trim();
@@ -1082,11 +1082,11 @@ fn round_pct(v: f64) -> i64 {
 // SECONDS (it health-checks every remote connector serially), and this binary
 // runs on every render. So the bundled `claude-mcp-probe` hook does that work
 // once at SessionStart and writes {name: status} to
-// ~/.claude/statusline-cache/mcp.json (override: CLAUDE_STATUSLINE_MCP_CACHE).
+// ~/.claude/healthline-cache/mcp.json (override: CLAUDE_HEALTHLINE_MCP_CACHE).
 //
 // This segment renders ONLY problems — servers needing auth or failing to
 // connect. "All 17 connected" is a fact the user cannot act on, so a healthy
-// fleet draws nothing at all. Disable entirely with CLAUDE_STATUSLINE_NO_MCP=1.
+// fleet draws nothing at all. Disable entirely with CLAUDE_HEALTHLINE_NO_MCP=1.
 // ---------------------------------------------------------------------------
 
 /// Beyond this the probe data describes a session that is long gone.
@@ -1106,12 +1106,12 @@ impl McpTrouble {
 }
 
 fn mcp_cache_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CLAUDE_STATUSLINE_MCP_CACHE") {
+    if let Ok(p) = std::env::var("CLAUDE_HEALTHLINE_MCP_CACHE") {
         if !p.trim().is_empty() {
             return Some(PathBuf::from(p));
         }
     }
-    Some(claude_config_dir()?.join("statusline-cache/mcp.json"))
+    Some(claude_config_dir()?.join("healthline-cache/mcp.json"))
 }
 
 /// Tally the bad states in a probe payload. `unknown` is deliberately NOT
@@ -1162,7 +1162,7 @@ fn render_mcp(t: &McpTrouble) -> Option<(&'static str, String)> {
 }
 
 fn mcp_badge(g: &Glyphs) -> Option<Seg> {
-    if matches!(std::env::var("CLAUDE_STATUSLINE_NO_MCP"), Ok(v) if v == "1") {
+    if matches!(std::env::var("CLAUDE_HEALTHLINE_NO_MCP"), Ok(v) if v == "1") {
         return None;
     }
     let raw = std::fs::read_to_string(mcp_cache_path()?).ok()?;
@@ -1177,7 +1177,7 @@ fn mcp_badge(g: &Glyphs) -> Option<Seg> {
 // The GLOBAL skill count is deliberately not rendered: it is the same number on
 // every repo and every render, so it informs no decision. What changes as you
 // move around — and what you may not know a repo ships — is `.claude/skills/`
-// inside the project. Disable with CLAUDE_STATUSLINE_NO_SKILLS=1.
+// inside the project. Disable with CLAUDE_HEALTHLINE_NO_SKILLS=1.
 //
 // A plain read_dir of one directory is ~microseconds warm, so this needs no
 // cache; there is nothing here to amortize.
@@ -1225,7 +1225,7 @@ fn project_skills_dir(cwd: Option<&str>) -> Option<PathBuf> {
 }
 
 fn skills_badge(cwd: Option<&str>, g: &Glyphs) -> Option<Seg> {
-    if matches!(std::env::var("CLAUDE_STATUSLINE_NO_SKILLS"), Ok(v) if v == "1") {
+    if matches!(std::env::var("CLAUDE_HEALTHLINE_NO_SKILLS"), Ok(v) if v == "1") {
         return None;
     }
     let n = count_skills(&project_skills_dir(cwd)?);
@@ -1338,7 +1338,7 @@ fn render(input: &Input, g: &Glyphs) -> String {
 
     // 2. CAVEMAN MODE — sits beside the model because it describes how that
     // model is answering. Omitted entirely when caveman isn't active.
-    if !matches!(std::env::var("CLAUDE_STATUSLINE_NO_CAVEMAN"), Ok(v) if v == "1") {
+    if !matches!(std::env::var("CLAUDE_HEALTHLINE_NO_CAVEMAN"), Ok(v) if v == "1") {
         if let Some(badge) = claude_config_dir().as_deref().and_then(caveman_badge) {
             segs.push(Seg::new("caveman", ORANGE, g.caveman, &clean(&badge, 28)));
         }
@@ -1741,7 +1741,7 @@ mod tests {
     /// touched and the tests stay parallel-safe.
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "claude-statusline-test-{tag}-{}",
+            "claude-healthline-test-{tag}-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);

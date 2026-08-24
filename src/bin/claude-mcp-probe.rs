@@ -2,13 +2,13 @@
 //!
 //! Wire this to Claude Code's `SessionStart` hook. It runs `claude mcp list`,
 //! reduces the output to `{name: status}` pairs, and writes them to
-//! `~/.claude/statusline-cache/mcp.json` (override with
-//! `CLAUDE_STATUSLINE_MCP_CACHE`). The status line only ever READS that file,
+//! `~/.claude/healthline-cache/mcp.json` (override with
+//! `CLAUDE_HEALTHLINE_MCP_CACHE`). The status line only ever READS that file,
 //! because `claude mcp list` takes seconds — far too slow to run on a render.
 //!
 //! Claude Code BLOCKS session startup on its hooks, so the hook invocation
 //! itself does almost nothing: it stats the cache, returns immediately if it is
-//! younger than `CLAUDE_STATUSLINE_MCP_REFRESH` (default 4h), and otherwise
+//! younger than `CLAUDE_HEALTHLINE_MCP_REFRESH` (default 4h), and otherwise
 //! re-launches itself DETACHED to do the slow part. Run with `--foreground` to
 //! probe synchronously (useful for testing or a manual refresh).
 //!
@@ -40,7 +40,7 @@ const MAX_NAME_CHARS: usize = 48;
 const MAX_SERVERS: usize = 128;
 
 fn cache_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CLAUDE_STATUSLINE_MCP_CACHE") {
+    if let Ok(p) = std::env::var("CLAUDE_HEALTHLINE_MCP_CACHE") {
         if !p.trim().is_empty() {
             return Some(PathBuf::from(p));
         }
@@ -49,11 +49,11 @@ fn cache_path() -> Option<PathBuf> {
         Ok(d) if !d.trim().is_empty() => PathBuf::from(d),
         _ => Path::new(&std::env::var("HOME").ok()?).join(".claude"),
     };
-    Some(base.join("statusline-cache/mcp.json"))
+    Some(base.join("healthline-cache/mcp.json"))
 }
 
 fn claude_bin() -> String {
-    if let Ok(b) = std::env::var("CLAUDE_STATUSLINE_CLAUDE_BIN") {
+    if let Ok(b) = std::env::var("CLAUDE_HEALTHLINE_CLAUDE_BIN") {
         if !b.trim().is_empty() {
             return b;
         }
@@ -182,14 +182,14 @@ fn cache_age_secs(path: &Path) -> Option<u64> {
 /// the order of days, so refreshing every session start would spend seconds of
 /// CPU to learn nothing.
 fn refresh_interval_secs() -> u64 {
-    std::env::var("CLAUDE_STATUSLINE_MCP_REFRESH")
+    std::env::var("CLAUDE_HEALTHLINE_MCP_REFRESH")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(4 * 3600)
 }
 
 /// Set in the detached child so it knows to do the actual work.
-const CHILD_ENV: &str = "CLAUDE_STATUSLINE_MCP_PROBE_CHILD";
+const CHILD_ENV: &str = "CLAUDE_HEALTHLINE_MCP_PROBE_CHILD";
 
 /// Re-launch this same binary detached, so the SessionStart hook returns
 /// immediately. Claude Code BLOCKS session startup on its hooks, and
@@ -216,7 +216,7 @@ fn main() {
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
 
-    if matches!(std::env::var("CLAUDE_STATUSLINE_NO_MCP"), Ok(v) if v == "1") {
+    if matches!(std::env::var("CLAUDE_HEALTHLINE_NO_MCP"), Ok(v) if v == "1") {
         return;
     }
 

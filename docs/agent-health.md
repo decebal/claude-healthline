@@ -50,7 +50,7 @@ A high average must never conceal a critical failure, so **any** `flag`, a
 ## State file
 
 `~/.claude/agent-health/<session_id>.json` (override the dir with
-`CLAUDE_STATUSLINE_HEALTH_DIR`). Every field optional:
+`CLAUDE_HEALTHLINE_HEALTH_DIR`). Every field optional:
 
 ```json
 {
@@ -108,11 +108,11 @@ persistent degradation.
 ## Wiring the observable hook
 
 Build/install both binaries (`cargo install --path .` installs
-`claude-statusline` **and** `claude-health-hook`). Then in `settings.json`:
+`claude-healthline` **and** `claude-health-hook`). Then in `settings.json`:
 
 ```json
 {
-  "statusLine": { "type": "command", "command": "claude-statusline" },
+  "statusLine": { "type": "command", "command": "claude-healthline" },
   "hooks": {
     "PostToolUse": [
       { "matcher": "*", "hooks": [
@@ -214,6 +214,6 @@ jq --argjson r 4.9 --argjson t 4.8 --argjson k 4.6 \
 
 | Var | Effect |
 |-----|--------|
-| `CLAUDE_STATUSLINE_HEALTH_DIR` | override the state-file dir |
-| `CLAUDE_STATUSLINE_NO_HEALTH=1` | hide the health segment |
-| `CLAUDE_STATUSLINE_ASCII=1` | ASCII labels instead of Nerd-Font glyphs |
+| `CLAUDE_HEALTHLINE_HEALTH_DIR` | override the state-file dir |
+| `CLAUDE_HEALTHLINE_NO_HEALTH=1` | hide the health segment |
+| `CLAUDE_HEALTHLINE_ASCII=1` | ASCII labels instead of Nerd-Font glyphs |

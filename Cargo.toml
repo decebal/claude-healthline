@@ -1,18 +1,18 @@
 [package]
-name = "claude-statusline"
+name = "claude-healthline"
 version = "0.1.0"
 edition = "2021"
-description = "A fast, never-blank Claude Code status line: powerline + Nerd-Font segments for model, git, context %, cost + burn rate + today's spend, and more."
+description = "A fast, never-blank Claude Code status line that tells you when your agent is going wrong: agent-health score, MCP servers needing attention, context %, and live spend."
 license = "MIT"
-repository = "https://github.com/decebal/claude-statusline"
-homepage = "https://github.com/decebal/claude-statusline"
+repository = "https://github.com/decebal/claude-healthline"
+homepage = "https://github.com/decebal/claude-healthline"
 readme = "README.md"
-keywords = ["claude", "claude-code", "statusline", "cli", "powerline"]
+keywords = ["claude-code", "statusline", "agent-health", "observability", "cli"]
 categories = ["command-line-utilities"]
 authors = ["decebal"]
 
 [[bin]]
-name = "claude-statusline"
+name = "claude-healthline"
 path = "src/main.rs"
 
 # Companion hook: populates the OBSERVABLE agent-health dimensions (stability +
