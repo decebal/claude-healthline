@@ -125,6 +125,8 @@ struct Glyphs {
     ratelimit: &'static str, // U+F017  clock
     lines: &'static str,     // U+F0DEB plus-minus
     warning: &'static str,   // U+F071  warning triangle
+    mcp: &'static str,       // U+F0A0A server-network (MCP server health)
+    skills: &'static str,    // U+F0EDA toolbox (project-local skills)
     sep: String,             // U+E0B1 powerline thin separator, dim, padded
 }
 
@@ -141,6 +143,8 @@ fn nerd_glyphs() -> Glyphs {
         ratelimit: "\u{F017}",
         lines: "\u{F0DEB}",
         warning: "\u{F071}",
+        mcp: "\u{F0A0A}",
+        skills: "\u{F0EDA}",
         sep: format!("{DIM} \u{E0B1} {RESET}"),
     }
 }
@@ -158,6 +162,8 @@ fn ascii_glyphs() -> Glyphs {
         ratelimit: "rate",
         lines: "lines",
         warning: "!",
+        mcp: "mcp",
+        skills: "skills",
         sep: format!("{DIM} | {RESET}"),
     }
 }
@@ -1069,6 +1075,166 @@ fn round_pct(v: f64) -> i64 {
     v.round().clamp(0.0, 100.0) as i64
 }
 
+// ---------------------------------------------------------------------------
+// MCP server health — a DISPLAY over the `claude-mcp-probe` cache.
+//
+// The status line CANNOT check MCP health itself: `claude mcp list` takes
+// SECONDS (it health-checks every remote connector serially), and this binary
+// runs on every render. So the bundled `claude-mcp-probe` hook does that work
+// once at SessionStart and writes {name: status} to
+// ~/.claude/statusline-cache/mcp.json (override: CLAUDE_STATUSLINE_MCP_CACHE).
+//
+// This segment renders ONLY problems — servers needing auth or failing to
+// connect. "All 17 connected" is a fact the user cannot act on, so a healthy
+// fleet draws nothing at all. Disable entirely with CLAUDE_STATUSLINE_NO_MCP=1.
+// ---------------------------------------------------------------------------
+
+/// Beyond this the probe data describes a session that is long gone.
+const MCP_MAX_AGE_SECS: u64 = 12 * 3600;
+
+/// A parse of the probe cache: how many servers sit in each bad state.
+#[derive(Debug, Default, PartialEq)]
+struct McpTrouble {
+    needs_auth: usize,
+    failed: usize,
+}
+
+impl McpTrouble {
+    fn is_clean(&self) -> bool {
+        self.needs_auth == 0 && self.failed == 0
+    }
+}
+
+fn mcp_cache_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("CLAUDE_STATUSLINE_MCP_CACHE") {
+        if !p.trim().is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    Some(claude_config_dir()?.join("statusline-cache/mcp.json"))
+}
+
+/// Tally the bad states in a probe payload. `unknown` is deliberately NOT
+/// counted as trouble: the probe emits it when the CLI's wording changed, and a
+/// permanent false alarm trains the user to ignore the segment.
+fn parse_mcp_cache(raw: &str, now: u64) -> Option<McpTrouble> {
+    let v: Value = serde_json::from_str(raw).ok()?;
+    let updated = v.get("updated_at").and_then(|u| u.as_u64()).unwrap_or(0);
+    if updated == 0 || now.saturating_sub(updated) > MCP_MAX_AGE_SECS {
+        return None;
+    }
+    let servers = v.get("servers")?.as_object()?;
+    let mut t = McpTrouble::default();
+    for status in servers.values().filter_map(|s| s.as_str()) {
+        match status {
+            "needs_auth" => t.needs_auth += 1,
+            "failed" => t.failed += 1,
+            _ => {}
+        }
+    }
+    Some(t)
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `1 down · 2 auth` — `None` when the probe never ran, the cache is stale, or
+/// every server is healthy.
+fn render_mcp(t: &McpTrouble) -> Option<(&'static str, String)> {
+    if t.is_clean() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    // Failures lead: a dead server breaks calls outright, whereas a
+    // needs-auth one is a prompt away from working.
+    if t.failed > 0 {
+        parts.push(format!("{} down", t.failed));
+    }
+    if t.needs_auth > 0 {
+        parts.push(format!("{} auth", t.needs_auth));
+    }
+    let color = if t.failed > 0 { RED } else { YELLOW };
+    Some((color, parts.join(" \u{00B7} ")))
+}
+
+fn mcp_badge(g: &Glyphs) -> Option<Seg> {
+    if matches!(std::env::var("CLAUDE_STATUSLINE_NO_MCP"), Ok(v) if v == "1") {
+        return None;
+    }
+    let raw = std::fs::read_to_string(mcp_cache_path()?).ok()?;
+    let trouble = parse_mcp_cache(&raw, now_unix())?;
+    let (color, text) = render_mcp(&trouble)?;
+    Some(Seg::new("mcp", color, g.mcp, &clean(&text, 20)))
+}
+
+// ---------------------------------------------------------------------------
+// Project-local skills.
+//
+// The GLOBAL skill count is deliberately not rendered: it is the same number on
+// every repo and every render, so it informs no decision. What changes as you
+// move around — and what you may not know a repo ships — is `.claude/skills/`
+// inside the project. Disable with CLAUDE_STATUSLINE_NO_SKILLS=1.
+//
+// A plain read_dir of one directory is ~microseconds warm, so this needs no
+// cache; there is nothing here to amortize.
+// ---------------------------------------------------------------------------
+
+/// Don't enumerate an unbounded directory just to print a number.
+const SKILLS_MAX_SCAN: usize = 256;
+
+/// Count immediate subdirectories of `dir` that contain a `SKILL.md`.
+fn count_skills(dir: &Path) -> usize {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    entries
+        .flatten()
+        .take(SKILLS_MAX_SCAN)
+        .filter(|e| {
+            // `is_dir()` follows symlinks on purpose: linking a skill into
+            // .claude/skills is a normal way to install one.
+            e.path().is_dir() && e.path().join("SKILL.md").is_file()
+        })
+        .count()
+}
+
+/// The project's own skills dir, or `None` when the cwd's `.claude/skills`
+/// resolves to the GLOBAL one. That happens whenever Claude Code is launched
+/// from `$HOME`, and counting 60-odd global skills as "project" skills would be
+/// actively misleading.
+fn project_skills_dir(cwd: Option<&str>) -> Option<PathBuf> {
+    let dir = Path::new(cwd?).join(".claude/skills");
+    let global = claude_config_dir().map(|d| d.join("skills"));
+    let same = match (
+        dir.canonicalize(),
+        global.and_then(|g| g.canonicalize().ok()),
+    ) {
+        (Ok(a), Some(b)) => a == b,
+        _ => false,
+    };
+    if same {
+        None
+    } else {
+        Some(dir)
+    }
+}
+
+fn skills_badge(cwd: Option<&str>, g: &Glyphs) -> Option<Seg> {
+    if matches!(std::env::var("CLAUDE_STATUSLINE_NO_SKILLS"), Ok(v) if v == "1") {
+        return None;
+    }
+    let n = count_skills(&project_skills_dir(cwd)?);
+    if n == 0 {
+        return None;
+    }
+    Some(Seg::new("skills", DIM, g.skills, &format!("{n} proj")))
+}
+
 /// Visible width of the separator (` ▏ ` / ` | ` = 3 columns in both themes).
 const SEP_PLAIN: usize = 3;
 
@@ -1118,9 +1284,13 @@ fn fit_within(mut segs: Vec<Seg>, sep: &str, cols: Option<usize>) -> String {
         };
 
         // Each reduction applies only while still over budget, in value order.
-        // The caveman badge goes first: it reports a mode the user chose and
-        // already knows, so it is the cheapest thing on the row to lose.
-        for kind in ["caveman", "lines", "rate"] {
+        // The project-skills count goes first — it is ambient inventory, not
+        // news. Then the caveman badge: it reports a mode the user chose and
+        // already knows, so it is the cheapest remaining thing to lose.
+        // NOTE: "mcp" is absent from every drop list on purpose. It renders
+        // only when a server is down or unauthenticated, and hiding that to
+        // save three columns would defeat the point of having it.
+        for kind in ["skills", "caveman", "lines", "rate"] {
             if width(&segs) > cols {
                 segs.retain(|s| s.kind != kind);
             }
@@ -1209,6 +1379,12 @@ fn render(input: &Input, g: &Glyphs) -> String {
         ));
     }
 
+    // 4b. PROJECT SKILLS — sits with the repo/branch cluster because it
+    // describes the checkout you are standing in, not the session.
+    if let Some(s) = skills_badge(input.cwd.as_deref(), g) {
+        segs.push(s);
+    }
+
     // 5. CONTEXT %
     let exceeds = input.exceeds_200k_tokens.unwrap_or(false);
     let pct: Option<i64> = input
@@ -1295,6 +1471,13 @@ fn render(input: &Input, g: &Glyphs) -> String {
         ));
     }
     segs.push(cost_seg);
+
+    // 6b. MCP TROUBLE — renders nothing when the fleet is healthy, so its mere
+    // presence is the signal. Never dropped for width: it only ever appears
+    // when something needs fixing.
+    if let Some(s) = mcp_badge(g) {
+        segs.push(s);
+    }
 
     // 7. TASK
     if let Some(id) = resolve_task_id(input.cwd.as_deref()) {
@@ -1678,5 +1861,118 @@ mod tests {
         );
         assert!(out.contains("lines"), "lines outrank the badge: {out}");
         assert!(out.contains("Opus 5"));
+    }
+
+    // --- MCP health ------------------------------------------------------
+
+    fn mcp_json(updated: u64, servers: &str) -> String {
+        format!("{{\"updated_at\":{updated},\"servers\":{servers}}}")
+    }
+
+    #[test]
+    fn a_healthy_fleet_renders_nothing() {
+        let raw = mcp_json(1_000, "{\"a\":\"connected\",\"b\":\"connected\"}");
+        let t = parse_mcp_cache(&raw, 1_010).expect("fresh cache parses");
+        assert!(t.is_clean());
+        assert_eq!(render_mcp(&t), None);
+    }
+
+    #[test]
+    fn counts_auth_and_failures_separately() {
+        let raw = mcp_json(
+            1_000,
+            "{\"a\":\"connected\",\"b\":\"needs_auth\",\"c\":\"needs_auth\",\"d\":\"failed\"}",
+        );
+        let t = parse_mcp_cache(&raw, 1_010).unwrap();
+        assert_eq!(
+            t,
+            McpTrouble {
+                needs_auth: 2,
+                failed: 1
+            }
+        );
+        let (color, text) = render_mcp(&t).unwrap();
+        assert_eq!(text, "1 down \u{00B7} 2 auth");
+        assert_eq!(color, RED, "a dead server outranks an unauthenticated one");
+    }
+
+    #[test]
+    fn auth_only_trouble_is_a_warning_not_an_error() {
+        let raw = mcp_json(1_000, "{\"b\":\"needs_auth\"}");
+        let t = parse_mcp_cache(&raw, 1_010).unwrap();
+        let (color, text) = render_mcp(&t).unwrap();
+        assert_eq!(text, "1 auth");
+        assert_eq!(color, YELLOW);
+    }
+
+    #[test]
+    fn unknown_status_is_not_reported_as_trouble() {
+        // The probe emits "unknown" when the CLI's wording changed. A standing
+        // false alarm would train the user to ignore this segment.
+        let raw = mcp_json(1_000, "{\"a\":\"unknown\",\"b\":\"disabled\"}");
+        let t = parse_mcp_cache(&raw, 1_010).unwrap();
+        assert!(t.is_clean());
+    }
+
+    #[test]
+    fn a_stale_or_malformed_cache_yields_no_segment() {
+        // Older than MCP_MAX_AGE_SECS.
+        let raw = mcp_json(1_000, "{\"b\":\"needs_auth\"}");
+        assert_eq!(parse_mcp_cache(&raw, 1_000 + MCP_MAX_AGE_SECS + 1), None);
+        // No timestamp at all: cannot judge freshness, so render nothing.
+        assert_eq!(
+            parse_mcp_cache("{\"servers\":{\"b\":\"failed\"}}", 9_999),
+            None
+        );
+        // Not JSON, wrong shape, empty.
+        assert_eq!(parse_mcp_cache("not json", 9_999), None);
+        assert_eq!(parse_mcp_cache("{\"updated_at\":1000}", 1_010), None);
+        assert_eq!(parse_mcp_cache("", 9_999), None);
+    }
+
+    #[test]
+    fn mcp_survives_the_narrowest_terminal() {
+        let g = ascii_glyphs();
+        let segs = vec![
+            Seg::new("model", DIM_CYAN, g.model, "Opus 5"),
+            Seg::new("skills", DIM, g.skills, "3 proj"),
+            Seg::new("mcp", RED, g.mcp, "1 down"),
+        ];
+        let out = fit_within(segs, &g.sep, Some(10));
+        assert!(out.contains("1 down"), "mcp must never be dropped: {out}");
+        assert!(!out.contains("proj"), "skills drop first: {out}");
+    }
+
+    // --- project-local skills --------------------------------------------
+
+    #[test]
+    fn counts_only_dirs_that_hold_a_skill_md() {
+        let base = std::env::temp_dir().join(format!("cs-skills-{}", std::process::id()));
+        let skills = base.join(".claude/skills");
+        std::fs::create_dir_all(skills.join("real")).unwrap();
+        std::fs::write(skills.join("real/SKILL.md"), "x").unwrap();
+        std::fs::create_dir_all(skills.join("empty-dir")).unwrap();
+        std::fs::write(skills.join("loose.md"), "x").unwrap();
+
+        assert_eq!(count_skills(&skills), 1);
+        assert_eq!(
+            count_skills(&base.join("nope")),
+            0,
+            "missing dir is 0, not a panic"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_global_skills_dir_is_never_counted_as_project_skills() {
+        // Launching Claude Code from $HOME makes cwd/.claude/skills the GLOBAL
+        // dir; reporting "66 proj" there would be a lie.
+        let home = std::env::var("HOME").unwrap();
+        let global = claude_config_dir().unwrap().join("skills");
+        if global.exists() {
+            assert_eq!(project_skills_dir(Some(&home)), None);
+        }
+        assert!(project_skills_dir(Some("/tmp/some-repo")).is_some());
+        assert_eq!(project_skills_dir(None), None);
     }
 }
