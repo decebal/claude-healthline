@@ -75,7 +75,7 @@ fn safe_sid(s: &str) -> Option<&str> {
 }
 
 fn health_dir() -> Option<PathBuf> {
-    if let Some(d) = env_string("CLAUDE_STATUSLINE_HEALTH_DIR") {
+    if let Some(d) = env_string("CLAUDE_HEALTHLINE_HEALTH_DIR") {
         return Some(PathBuf::from(d));
     }
     let home = std::env::var("HOME").ok()?;

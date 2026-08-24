@@ -11,7 +11,7 @@
 //! agent's own self-report. Existing values in the file are preserved. Always
 //! exits 0 so it can never break a turn.
 //!
-//! Override the state dir with `CLAUDE_STATUSLINE_HEALTH_DIR`.
+//! Override the state dir with `CLAUDE_HEALTHLINE_HEALTH_DIR`.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 const WINDOW: usize = 12;
 
 fn health_dir() -> Option<PathBuf> {
-    if let Ok(d) = std::env::var("CLAUDE_STATUSLINE_HEALTH_DIR") {
+    if let Ok(d) = std::env::var("CLAUDE_HEALTHLINE_HEALTH_DIR") {
         if !d.trim().is_empty() {
             return Some(PathBuf::from(d));
         }
