@@ -1,6 +1,17 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="960" height="46" viewBox="0 0 960 46" role="img" aria-label="claude-statusline status bar preview">
-  <rect x="0.5" y="0.5" width="959" height="45" rx="8" fill="#0d1117" stroke="#30363d"/>
-  <text x="18" y="29" xml:space="preserve" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" font-weight="500">
-    <tspan fill="#56b6c2">◈ Opus 4.8</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#8b949e">my-repo</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#c678dd"> main</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#98c379">▐ 42%</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#98c379">$2.40</tspan><tspan fill="#6e7681"> · ~$1.60/hr · today $12.40</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#e5c07b">✓ t-fa00</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#8b949e">5h 24% · 7d 41%</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#98c379">+156</tspan><tspan fill="#e06c75"> -23</tspan>
-  </text>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="153" viewBox="0 0 960 153" role="img" aria-label="claude-statusline preview: the same status line in three states — everyday, trouble, and a half-width pane">
+  <rect x="0.5" y="0.5" width="959" height="152" rx="8" fill="#0d1117" stroke="#30363d"/>
+  <g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" xml:space="preserve">
+
+    <!-- 1. everyday — every dimension green, so the MCP segment draws nothing -->
+    <text x="18" y="26" font-size="10.5" fill="#6e7681">everyday — all green, so the MCP segment draws nothing at all</text>
+    <text x="18" y="45" font-size="13" font-weight="500"><tspan fill="#98c379">◆ R4.9 T4.8 S4.6</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#56b6c2">◈ Opus 5</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#8b949e">my-repo</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#c678dd">⎇ main</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#8b949e">⚒ 3 proj</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#98c379">▐ 42%</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#98c379">$2.40</tspan><tspan fill="#6e7681"> · ~$1.60/hr · today $12.40</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#e5c07b">✓ t-fa00</tspan></text>
+
+    <!-- 2. trouble — a drift loop, danger-zone context, one server down + two unauthenticated -->
+    <text x="18" y="72" font-size="10.5" fill="#6e7681">trouble — instruction drift, danger-zone context, a server down</text>
+    <text x="18" y="91" font-size="13" font-weight="500"><tspan fill="#e5c07b">◆ stab 4.2 !3 →repair</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#56b6c2">◈ Opus 5</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#d18f52">⛏ full · 114.9k saved</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#ff7b72" font-weight="700">▐ 87%</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#98c379">$18.90</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#e06c75">⚠ 1 down · 2 auth</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#98c379">+402</tspan><tspan fill="#e06c75"> -118</tspan></text>
+
+    <!-- 3. the same trouble session squeezed into a half-width pane -->
+    <text x="18" y="118" font-size="10.5" fill="#6e7681">half-width pane — the essentials and the warning survive</text>
+    <text x="18" y="137" font-size="13" font-weight="500"><tspan fill="#e5c07b">◆ stab 4.2</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#56b6c2">◈ Opus 5</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#ff7b72" font-weight="700">▐ 87%</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#98c379">$18.90</tspan><tspan fill="#484f58"> │ </tspan><tspan fill="#e06c75">⚠ 1 down · 2 auth</tspan></text>
+  </g>
 </svg>

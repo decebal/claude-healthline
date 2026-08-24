@@ -4,10 +4,16 @@ A compact, multi-dimensional readout of how the agent is doing **right now** —
 shown as the first segment of the status line:
 
 ```
- R4.8 T4.7 S4.6            healthy   (green)
+ R4.9 T4.8 S4.6            healthy   (green)
+ R4.9 T4.7 S4.6 →repair    degraded  (yellow, truth under its 4.75 bar)
  stab 4.2 !3 →repair       degraded  (yellow, live loop)
  R– T4.4 S– →restart       restart   (red, hard gate)
 ```
+
+Note rows one and two: **one tenth of a point on `T` is the whole verdict.** The
+green bars are deliberately strict (see [Thresholds → verdict](#thresholds--verdict)) — `T4.7` is
+already degraded, because fabrication risk shouldn't have to clear a low bar to
+get your attention.
 
 - **R** = rule adherence (system/developer/user instructions)
 - **T** = truthfulness / groundedness
@@ -48,8 +54,8 @@ A high average must never conceal a critical failure, so **any** `flag`, a
 
 ```json
 {
-  "rules":     { "score": 4.8, "reason": "all required steps done", "flag": false },
-  "truth":     { "score": 4.7, "reason": "claims grounded in tool output" },
+  "rules":     { "score": 4.9, "reason": "all required steps done", "flag": false },
+  "truth":     { "score": 4.8, "reason": "claims grounded in tool output" },
   "task":      { "score": 4.6, "reason": "completed after one correction" },
   "stability": { "score": 5.0, "reason": "no tool errors (last 12)" },
   "drift": 0,
@@ -199,7 +205,7 @@ Merge into the same file, keying off the status line's `session_id`:
 ```bash
 f="$HOME/.claude/agent-health/$SID.json"
 tmp=$(mktemp)
-jq --argjson r 4.8 --argjson t 4.7 --argjson k 4.6 \
+jq --argjson r 4.9 --argjson t 4.8 --argjson k 4.6 \
    '.rules={score:$r} | .truth={score:$t} | .task={score:$k}' \
    "$f" 2>/dev/null > "$tmp" && mv "$tmp" "$f"
 ```
