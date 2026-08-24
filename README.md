@@ -5,27 +5,31 @@
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
 [![For Claude Code](https://img.shields.io/badge/for-Claude%20Code-6f42c1.svg)](https://code.claude.com/docs/en/statusline)
 
-**claude-statusline is a fast, dependency-light Rust status line for [Claude Code](https://code.claude.com/docs/en/statusline).** It turns the JSON that Claude Code streams on stdin into a single powerline row showing your model, git branch, color-coded context-window usage, live spend (session cost, per-hour burn rate, today's total across every session), and an optional multi-dimensional **[agent-health](#agent-health-score)** readout — and it **never blanks, hangs, or panics**, whatever the session sends it.
+**claude-statusline is a fast, dependency-light Rust status line for [Claude Code](https://code.claude.com/docs/en/statusline).** It turns the JSON that Claude Code streams on stdin into a single powerline row showing your model, git branch, color-coded context-window usage, live spend (session cost, per-hour burn rate, today's total across every session), an optional multi-dimensional **[agent-health](#agent-health-score)** readout, and the **[MCP servers that need your attention](#skills-and-mcp-servers)** — and it **never blanks, hangs, or panics**, whatever the session sends it.
 
-![claude-statusline status bar preview](docs/statusline.svg)
+![claude-statusline status bar preview: the same status line in three states — everyday, trouble, and a half-width pane](docs/statusline.svg)
 
-> The real status line prefixes each segment with a [Nerd Font](https://www.nerdfonts.com/) powerline glyph. Terminals without a Nerd Font (and GitHub itself) can't render those glyphs, so set `CLAUDE_STATUSLINE_ASCII=1` for the plain-text form:
+Three states, one line. Notice what the middle row does that the top row doesn't: **problems announce themselves, and nothing else competes for the space.** Context crosses into the danger zone and turns bold red, a server goes down and a red `⚠` appears — while on the healthy top row the MCP segment draws nothing at all. Squeeze the pane and the warning is the thing that *survives*.
+
+> The real status line prefixes each segment with a [Nerd Font](https://www.nerdfonts.com/) powerline glyph, and the image above substitutes lookalikes because GitHub can't render Nerd-Font glyphs. Set `CLAUDE_STATUSLINE_ASCII=1` for the plain-text form — this is the top row above, verbatim:
 
 ```text
-model Opus 4.8 | dir my-repo | git main | ctx 42% | cost $2.40 · ~$1.60/hr · today $12.40 | task t-fa00 | rate 5h 24% · 7d 41% | lines +156 -23
+health R4.9 T4.8 S4.6 | model Opus 5 | dir my-repo | git main | skills 3 proj | ctx 42% | cost $2.40 · ~$1.60/hr · today $12.40 | task t-fa00
 ```
 
 ## What it does
 
-claude-statusline renders up to ten segments in one line, each drawn only when its data is present. Context usage is color-coded green → yellow → **bold red** as you approach the limit, so the "danger zone" is visible at a glance.
+claude-statusline renders up to twelve segments in one line, **each drawn only when it has something to say.** Context usage is color-coded green → yellow → **bold red** as you approach the limit, so the danger zone is visible at a glance; the MCP segment appears only when a server is broken. Segments are listed here in the order they render:
 
-- **Agent health** *(optional, first segment)* — a multi-dimensional readout (rule-adherence · truthfulness · task-success · stability) with a green/yellow/red verdict, instead of one vague "quality" number. Only shows when a health state file exists. See [Agent health score](#agent-health-score).
+- **Agent health** *(optional, first)* — a multi-dimensional readout (rule-adherence · truthfulness · task-success · stability) with a green/yellow/red verdict, instead of one vague "quality" number. Only shows when a health state file exists. See [Agent health score](#agent-health-score).
 - **Model** — the active model's display name.
 - **Caveman mode** *(optional)* — the active [caveman](https://github.com/JuliusBrussee/caveman) compression level and the tokens it has saved. Only shows when caveman is active. See [Caveman mode](#caveman-mode).
 - **Repo / dir** — repository name, else the working-directory basename.
 - **Git branch** — read straight from `.git/HEAD` with **no `git` subprocess**; handles worktrees and detached HEAD.
+- **Project skills** *(optional)* — how many skills the current checkout ships in `.claude/skills/`. See [Skills and MCP servers](#skills-and-mcp-servers).
 - **Context %** — green `<50`, yellow `50–80`, **bold red `>80`** or when `exceeds_200k_tokens` trips.
 - **Cost cluster** — `session · ~$/hr burn · today's total` (see below).
+- **MCP trouble** *(optional)* — MCP servers that need re-auth or failed to connect. Draws nothing when the fleet is healthy. See [Skills and MCP servers](#skills-and-mcp-servers).
 - **Task** — the in-progress [chronis](https://github.com/rtk-ai) (`cn`) task in the current directory. Optional; omitted if `cn` or a task isn't found.
 - **Rate limit** — 5-hour and 7-day usage windows (shown on Pro/Max plans).
 - **Lines ±** — lines added/removed this session.
@@ -51,6 +55,13 @@ Add this to `~/.claude/settings.json` (global — applies to every project):
 
 Use an absolute path (e.g. `~/.cargo/bin/claude-statusline`) if `~/.cargo/bin` isn't on the status line's `PATH`. The status line refreshes on Claude Code's own events; add `"refreshInterval": 5` to the block if you want it to also tick while idle.
 
+That covers every segment above except two, each of which needs a hook to feed it:
+
+| Want | Add | Cost |
+|---|---|---|
+| MCP servers that need re-auth | `claude-mcp-probe` on `SessionStart` | ~10 ms per session — [details](#mcp-trouble--mcp-1-down--2-auth) |
+| The agent-health readout | `claude-health-hook` + `claude-health-report` | see [agent health](#agent-health-score) |
+
 ## Cost, burn rate, and today's spend
 
 The cost cluster answers "what is this session costing me, and how much have I spent today?" in one place. Session cost and the per-hour burn rate come directly from Claude Code's stdin JSON; today's total is computed the way [ccusage](https://ccusage.com/guide/statusline) does it.
@@ -73,13 +84,17 @@ readout instead of one vague "quality" number — so you can tell instruction
 drift from hallucination from execution failure at a glance:
 
 ```
- R4.8 T4.7 S4.6          healthy   (green)
+ R4.9 T4.8 S4.6          healthy   (green)
  stab 4.2 !3 →repair     degraded  (yellow — a live tool-failure loop)
  R– T4.4 S– →restart     restart   (red — hard gate)
 ```
 
 R = rule adherence · T = truthfulness · S = task success · `!N` = drift ·
 `→next` = recommended action. Colour is the verdict (green/yellow/red).
+
+The green bars are strict on purpose — rules and truthfulness need **≥ 4.75**,
+task ≥ 4.50 — so `T4.7` is already *degraded*, not healthy. Fabrication risk
+shouldn't have to clear a low bar to get noticed.
 
 **It only displays; it never invents scores.** The status line reads a
 per-session state file (`~/.claude/agent-health/<session_id>.json`), filled by
@@ -110,7 +125,7 @@ choosing between that badge and this status line, so claude-statusline renders
 the badge itself — no `bash`, no `node`, no wrapper:
 
 ```text
-model Opus 4.8 | ⛏ full · 114.9k saved | dir my-repo | git main | ctx 42% | cost $2.40
+model Opus 5 | ⛏ full · 114.9k saved | dir my-repo | git main | ctx 42% | cost $2.40
 ```
 
 It reads the two files the plugin already writes under `$CLAUDE_CONFIG_DIR`
@@ -130,6 +145,65 @@ parse as a whole token count (`114.9k`, `1.2M`) — so a planted
 `\x1b[31mPWNED\x1b[0m` renders nothing rather than repainting the terminal on
 every keystroke. Hide the segment with `CLAUDE_STATUSLINE_NO_CAVEMAN=1`.
 
+## Skills and MCP servers
+
+Claude Code's stdin payload says nothing about skills or MCP servers, so both of
+these segments derive their own data — and both are built around one rule: **a
+number that never changes is not worth a column.**
+
+### Project skills — `skills 3 proj`
+
+Counts the immediate subdirectories of `$cwd/.claude/skills/` that contain a
+`SKILL.md`. That is one `read_dir`, so it needs no cache.
+
+The **global** skill count is deliberately never rendered: it is the same number
+in every repo on every keystroke, so it can't inform a decision. What does change
+as you move around is the skills a checkout ships — often ones you didn't know
+were there. Launching Claude Code from `$HOME` makes `$cwd/.claude/skills` *be*
+the global directory; the segment detects that and draws nothing rather than
+reporting 60-odd global skills as "project" skills. Hide it with
+`CLAUDE_STATUSLINE_NO_SKILLS=1`.
+
+### MCP trouble — `mcp 1 down · 2 auth`
+
+Only failures and expired auth are rendered, in red and yellow respectively. "All
+17 connected" is not actionable, so a healthy fleet costs **zero columns** — the
+segment's mere presence is the signal. For the same reason it is the one optional
+segment that is *never* dropped on a narrow terminal.
+
+The status line can't measure this itself: `claude mcp list` health-checks every
+remote connector serially and takes **seconds**. So the bundled
+`claude-mcp-probe` binary does it out of band and leaves a small cache behind:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "claude-mcp-probe", "timeout": 5 }] }
+    ]
+  }
+}
+```
+
+Claude Code **blocks session startup on its hooks**, so the hook invocation does
+almost nothing: it `stat`s the cache, returns immediately if it is younger than
+`CLAUDE_STATUSLINE_MCP_REFRESH` (default 4h), and otherwise re-launches itself
+detached. Either way the hook returns in ~10 ms and your session starts now, with
+the refreshed data landing a few seconds later. Run `claude-mcp-probe
+--foreground` to refresh synchronously.
+
+> **The probe stores server names and statuses only — never the command line.**
+> `claude mcp list` echoes each stdio server's full argv, and those routinely
+> carry secrets (`--api-key eyJhbGci…`, tokens, DSNs). The middle field is
+> dropped before anything is written and is never logged. Two unit tests assert
+> that no part of a sample argv survives the parse.
+
+A status phrasing the probe doesn't recognize is recorded as `unknown` and
+**not** counted as trouble: if a future CLI reword turned into a permanent false
+alarm, you'd learn to ignore the segment. Equally, a probe run that parses to
+nothing leaves the old cache alone rather than writing `{}`, which would render
+as "everything is fine".
+
 ## Configuration
 
 Every knob is an environment variable, so it composes cleanly with the `command` string.
@@ -141,7 +215,12 @@ Every knob is an environment variable, so it composes cleanly with the `command`
 | `CLAUDE_STATUSLINE_NO_HEALTH=1` | Hide the agent-health segment |
 | `CLAUDE_STATUSLINE_HEALTH_DIR=<path>` | Override the health state-file dir |
 | `CLAUDE_STATUSLINE_NO_CAVEMAN=1` | Hide the caveman-mode segment |
-| `CLAUDE_CONFIG_DIR=<path>` | Where the caveman flag files are read from (default `~/.claude`) |
+| `CLAUDE_STATUSLINE_NO_SKILLS=1` | Hide the project-skills count |
+| `CLAUDE_STATUSLINE_NO_MCP=1` | Hide the MCP-trouble segment (and make the probe a no-op) |
+| `CLAUDE_STATUSLINE_MCP_CACHE=<path>` | Override the probe cache (default `$CLAUDE_CONFIG_DIR/statusline-cache/mcp.json`) |
+| `CLAUDE_STATUSLINE_MCP_REFRESH=<secs>` | How stale the probe cache may get before a refresh (default `14400`) |
+| `CLAUDE_STATUSLINE_CLAUDE_BIN=<path>` | Explicit path to the `claude` binary, for the probe |
+| `CLAUDE_CONFIG_DIR=<path>` | Where the caveman flag files and probe cache live (default `~/.claude`) |
 | `CLAUDE_STATUSLINE_CN_TTL=<secs>` | Chronis task cache TTL (default `8`) |
 | `CLAUDE_STATUSLINE_CN_BIN=<path>` | Explicit path to the `cn` binary |
 
@@ -150,31 +229,31 @@ Every knob is an environment variable, so it composes cleanly with the `command`
 A status line command runs constantly, so claude-statusline is built to be boring under load: fast, bounded, and impossible to break.
 
 - **Never blank / never panics.** Any stdin — empty, truncated, non-JSON, wrong-typed — still prints one non-empty line and exits `0`. (Claude Code blanks the status line on empty stdout or a non-zero exit, so this is a hard guarantee, verified across ~40 malformed and hostile inputs.)
-- **Never hangs.** The `cn` lookup is wall-clock bounded to **≤ 800 ms** and cached per directory; the daily-cost scan is cached for **60 s** and only reads files modified today. Warm renders are **single-digit milliseconds**.
-- **Tiny.** **Two** dependencies (`serde`, `serde_json`); a **~470 KB** stripped release binary. No `git`, `jq`, or shell subprocesses on the hot path.
+- **Never hangs.** The `cn` lookup is wall-clock bounded to **≤ 800 ms** and cached per directory; the daily-cost scan is cached for **60 s** and only reads files modified today. Warm renders are **single-digit milliseconds**. The skills count and MCP segment add **0.038 ms** together — one `read_dir` and one small JSON read; the multi-second `claude mcp list` runs in a detached hook, never on a render.
+- **Tiny.** **Two** dependencies (`serde`, `serde_json`); a **~525 KB** stripped release binary. No `git`, `jq`, or shell subprocesses on the hot path.
 
 ## Narrow and split-screen terminals
 
 claude-statusline adapts to the width Claude Code reports in `COLUMNS`. When space runs out it degrades gracefully — dropping the lowest-value segments first, then compacting the cost cluster — so **model, context %, and cost never fall off screen** on a half-width pane.
 
-Removal order: `lines±` → `rate limit` → cost `burn`/`today` extras → `repo` → `git branch` → `task`. The three essentials are never dropped.
+Removal order: `project skills` → `caveman` → `lines±` → `rate limit` → cost `burn`/`today` extras → `repo` → `git branch` → `task`. The three essentials are never dropped — and neither is `mcp`, which only appears when a server actually needs attention.
 
 | Terminal width | What stays |
 |---|---|
-| Full | all eight segments |
-| Wide split | drops lines±, then rate limit |
-| ~Half | cost compacts to session-only; drops repo + branch |
-| Very narrow | model · context % · cost |
+| Full | every segment that has data |
+| Wide split | drops project skills, then the caveman badge |
+| ~Half | drops lines± and rate limit; cost compacts to session-only |
+| Very narrow | model · context % · cost — **plus MCP trouble** |
 
 `COLUMNS` is exported by Claude Code v2.1.153+. If it's unset, the line renders in full (no truncation).
 
 ## How it compares
 
-claude-statusline optimizes for a lean, native, never-blank single binary with built-in cost math and chronis task tracking. Other excellent status lines trade that for more widgets or a config UI — pick what fits.
+claude-statusline optimizes for a lean, native, never-blank single binary with built-in cost math, chronis task tracking, and health signals you can act on — the agent-health readout and MCP trouble alerts are, as far as I know, unique to it. Other excellent status lines trade that for more widgets or a config UI — pick what fits.
 
 | Project | Runtime | Focus |
 |---|---|---|
-| **claude-statusline** (this) | Rust (single binary) | Speed, never-blank guarantee, cost + burn + daily, chronis tasks, **agent-health readout**, caveman badge |
+| **claude-statusline** (this) | Rust (single binary) | Speed, never-blank guarantee, cost + burn + daily, chronis tasks, **agent-health readout**, **MCP trouble alerts**, caveman badge |
 | [ccstatusline](https://github.com/sirmalloc/ccstatusline) | TypeScript / Bun | Many widgets + TUI configurator |
 | [claude-powerline](https://github.com/chongdashu/claude-powerline) | Node | Plugin-native powerline themes |
 | [CCometixLine](https://github.com/Haleclipse/CCometixLine) | Rust | Powerline segments |
@@ -191,6 +270,26 @@ It sums today's token usage from your Claude Code transcripts (`~/.claude/projec
 ### Will it slow down Claude Code?
 No. Warm renders are single-digit milliseconds; the only external call (`cn`) is capped at 800 ms and cached, and the daily scan is cached for 60 seconds. There are no `git`/`jq`/shell subprocesses on the hot path.
 
+### Why doesn't it show how many skills or MCP servers I have?
+
+Because those totals are the same on every render, so they can't tell you
+anything you don't already know. The status line shows the parts that *change* —
+the skills a given checkout ships, and the MCP servers that currently need
+fixing. See [Skills and MCP servers](#skills-and-mcp-servers).
+
+### Does the MCP segment slow down my session start?
+
+No. The `claude-mcp-probe` hook returns in about **10 ms**: it either finds a
+cache younger than 4 hours and does nothing, or re-launches itself detached and
+returns straight away. The multi-second `claude mcp list` never runs inline.
+
+### Does the probe write my MCP API keys to disk?
+
+No — and it is written specifically to avoid that. `claude mcp list` prints each
+stdio server's full argv, secrets included; the probe keeps only the server name
+and its status, and two unit tests assert no part of a sample argv survives the
+parse.
+
 ### Does it require chronis?
 No. The task segment simply disappears if `cn` (chronis) or an in-progress task isn't found. Every other segment works standalone.
 
@@ -204,7 +303,7 @@ The built-in prices are a snapshot (August 2026). When Anthropic changes prices,
 No — this renders it. Point `statusLine.command` at claude-statusline and the caveman level plus its savings figure appear as a segment, read from the same files the plugin already writes. Nothing to install, nothing to wrap, and `CLAUDE_STATUSLINE_NO_CAVEMAN=1` turns it off. See [Caveman mode](#caveman-mode).
 
 ### What happens on a small or split-screen terminal?
-It adapts to `COLUMNS` and drops the least-important segments first (the caveman badge, then lines±, then rate limit, then cost extras, then repo/branch/task), always keeping model, context %, and cost. So on a half-width pane you still see how full your context is and what the session costs.
+It adapts to `COLUMNS` and drops the least-important segments first (project skills, then the caveman badge, then lines±, then rate limit, then cost extras, then repo/branch/task), always keeping model, context %, cost — and MCP trouble. So on a half-width pane you still see how full your context is, what the session costs, and whether a server is down. The bottom row of the [preview image](#claude-statusline) is exactly this.
 
 ### What is the agent-health segment?
 An optional first segment reporting how the agent is doing across *separate* dimensions — rule-adherence, truthfulness, task-success, stability — with a green/yellow/red verdict, so you can tell instruction drift from hallucination from execution failure at a glance (not one vague "quality" number). It **only displays** scores from a per-session state file and **never invents them**: the bundled `claude-health-hook` fills the observable dimensions (stability + drift) from real tool outcomes; the rest render `–` until an evaluator or the agent writes them. Any safety/critical flag is a hard gate → red. Full schema, rubric, and hook wiring: [docs/agent-health.md](docs/agent-health.md).
