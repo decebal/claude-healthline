@@ -19,18 +19,22 @@ health R4.9 T4.8 S4.6 | model Opus 5 | dir my-repo | git main | skills 3 proj | 
 
 ## What it does
 
-claude-healthline renders up to twelve segments in one line, **each drawn only when it has something to say.** Context usage is color-coded green → yellow → **bold red** as you approach the limit, so the danger zone is visible at a glance; the MCP segment appears only when a server is broken. Segments are listed here in the order they render:
+claude-healthline renders up to fifteen segments, in one to three rows, **each drawn only when it has something to say.** Context usage is color-coded green → yellow → **bold red** as you approach the limit, so the danger zone is visible at a glance; the MCP segment appears only when a server is broken. Segments are listed here in the order they render:
 
 - **Agent health** *(optional, first)* — a multi-dimensional readout (rule-adherence · truthfulness · task-success · stability) with a green/yellow/red verdict, instead of one vague "quality" number. Only shows when a health state file exists. See [Agent health score](#agent-health-score).
+- **Session title** — the name from `--name` / `/rename`, else the AI-generated session title. Absent until the session has one.
 - **Model** — the active model's display name.
 - **Caveman mode** *(optional)* — the active [caveman](https://github.com/JuliusBrussee/caveman) compression level and the tokens it has saved. Only shows when caveman is active. See [Caveman mode](#caveman-mode).
 - **Repo / dir** — repository name, else the working-directory basename.
-- **Git branch** — read straight from `.git/HEAD` with **no `git` subprocess**; handles worktrees and detached HEAD.
+- **Git branch** — read straight from `.git/HEAD` with **no `git` subprocess**; handles worktrees and detached HEAD. With `CLAUDE_HEALTHLINE_WORKTREE=1` the glyph changes inside a linked worktree and the worktree names itself in its own colour, so the main tree is never mistaken for one. See [Worktrees](#worktrees).
 - **Project skills** *(optional)* — how many skills the current checkout ships in `.claude/skills/`. See [Skills and MCP servers](#skills-and-mcp-servers).
 - **Context %** — green `<50`, yellow `50–80`, **bold red `>80`** or when `exceeds_200k_tokens` trips.
 - **Cost cluster** — `session · ~$/hr burn · today's total` (see below).
 - **MCP trouble** *(optional)* — MCP servers that need re-auth or failed to connect. Draws nothing when the fleet is healthy. See [Skills and MCP servers](#skills-and-mcp-servers).
 - **Task** — the in-progress [chronis](https://github.com/rtk-ai) (`cn`) task in the current directory. Optional; omitted if `cn` or a task isn't found.
+- **Overarching todo** — the in-progress item from the session's task list, so the current goal stays on screen. See [Todo and step segments](#todo-and-step-segments).
+- **Progress + ETA** — how far through the session's task list it is, as a seven-cell bar and a straight-line estimate of the time left. Reads the `TaskCreate`/`TaskUpdate` events current models emit, or an older `TodoWrite` list. See [Progress and ETA](#progress-and-eta).
+- **Current step** — the tool call in flight, from a state file a `PreToolUse` hook writes.
 - **Rate limit** — 5-hour and 7-day usage windows (shown on Pro/Max plans).
 - **Lines ±** — lines added/removed this session.
 
@@ -76,7 +80,7 @@ That covers every segment above except two, each of which needs a hook to feed i
 
 ## Cost, burn rate, and today's spend
 
-The cost cluster answers "what is this session costing me, and how much have I spent today?" in one place. Session cost and the per-hour burn rate come directly from Claude Code's stdin JSON; today's total is computed the way [ccusage](https://ccusage.com/guide/statusline) does it.
+The cost cluster answers "what is this session costing me, and how much have I spent today?" in one place. The session figure carries the colour; the burn rate and today's total render grey so the number being watched reads first. Session cost and the per-hour burn rate come directly from Claude Code's stdin JSON; today's total is computed the way [ccusage](https://ccusage.com/guide/statusline) does it.
 
 Claude Code transcripts record `costUSD: null` on every line, so **today's total is derived, not read**: claude-healthline sums today's token `usage` across `~/.claude/projects/**/*.jsonl` and multiplies by a per-model price table. Prices are per-million tokens (August 2026); cache rates follow Anthropic's published ratios — cache read `0.10×` input, 5-minute cache write `1.25×`, 1-hour cache write `2.0×`.
 
@@ -216,9 +220,166 @@ alarm, you'd learn to ignore the segment. Equally, a probe run that parses to
 nothing leaves the old cache alone rather than writing `{}`, which would render
 as "everything is fine".
 
+## Worktrees
+
+The segment answers "where is this session **writing**?", which is not always
+where it stands. Three sources, in order:
+
+| Source | Meaning |
+|---|---|
+| `worktree.name` / `worktree.path` | The session's own worktree (`--worktree` and hook-based sessions). Reported even when `cwd` is the main tree. |
+| `claude-worktree-<session_id>` | A worktree the session picked mid-flight, recorded by a `PostToolUse` hook. Also reported from outside. |
+| `workspace.git_worktree` | `cwd` is inside a linked worktree. |
+| `.git` on disk | Fallback: a `.git` **file** whose `gitdir:` points into `.git/worktrees/<name>` is a worktree; a `.git` **directory** is the main tree. |
+
+```
+  feature-branch                 main tree
+  feature-branch  sandbox        worktree in play
+```
+
+**The worktree in play owns the branch.** When the worktree's root path is known,
+`HEAD` is read *there*, so an agent that creates a worktree and checks a branch
+out in it stops reporting the base branch it started on. `cwd`'s own `HEAD` is
+only the fallback. On a narrow terminal the worktree name is the first thing
+dropped, then the whole segment.
+
+A session that changes worktree by running plain git commands reports nothing on
+stdin, so a `PostToolUse` hook fills the gap: it takes the path the tool actually
+wrote (`file_path`, or the `git worktree add <path>` / `git -C <dir>` / `cd <dir>`
+target), walks up to the nearest `.git`, and writes `<name>\t<worktree root>` to
+`<step_dir>/claude-worktree-<session_id>` — clearing it when a write lands in the
+main tree. Only writing tools move the marker, so reading a file in the main tree
+cannot clear a worktree the session is still working in.
+
+Two traps the hook has to get right, both of which silently report the wrong tree:
+
+- `git worktree add` is matched **before** `git -C`, because
+  `git -C <main-repo> worktree add <path>` matches both and the `-C` directory is
+  the tree being left behind.
+- the path is found by walking the arguments, not by regex, because `-b <branch>`
+  and `--reason <text>` put a value between `add` and the path.
+
+## Todo and step segments
+
+Two segments answer "what am I working on, and what is happening right now?":
+
+```
+󰊕 Porting the todo segment to Rust  ▸ Bash: cargo test
+```
+
+The **todo** is read from the session transcript Claude Code names on stdin
+(`transcript_path`): the newest line carrying a real `TodoWrite` tool call wins,
+and its first `in_progress` item renders as that item's `activeForm` (falling
+back to `content`). A `TodoWrite` that leaves nothing in progress clears the
+segment rather than resurfacing an older goal, and a line that merely quotes the
+string `"TodoWrite"` — a transcript of this very README, say — is ignored. Only
+the trailing `CLAUDE_HEALTHLINE_TODO_TAIL` bytes are scanned, so a long session
+never makes a render expensive.
+
+## Progress and ETA
+
+The same transcript scan that finds the goal also counts the list, so progress
+costs nothing extra:
+
+```
+▮▮▮▮▯▯▯ ~9m  󰙅 Rendering the bar  ▸ Bash: cargo test
+```
+
+Two sources, because Claude Code changed tools underneath this:
+
+| Source | Shape |
+|---|---|
+| `TaskCreate` / `TaskUpdate` (current) | A stream of events, folded into a task map: creates add, updates move status, `deleted` removes. Wins whenever present. |
+| `TodoWrite` (older sessions) | A whole list per call; the newest call is authoritative. |
+
+`TaskUpdate`'s key names are read defensively — `taskId`, `id` and `task_id` all
+resolve, and `activeForm` / `active_form` likewise, because Claude Code repairs
+those names only *after* the call is streamed into the transcript.
+
+**These tools are opt-in on current models.** Opus 4.8, Sonnet 5, Fable 5 and
+Mythos 5 omit `TodoWrite`, `TaskCreate`, `TaskGet`, `TaskUpdate` and `TaskList`
+by default, so a session started without the opt-in has no list to measure and
+the segment stays hidden:
+
+```sh
+CLAUDE_CODE_ENABLE_TODO_TOOLS=1 claude
+```
+
+The bar fills `completed / total` of live tasks, rounded up over seven cells — a
+real fraction, not a guess, though seven cells is all the precision on offer. The
+ETA takes the **median gap between completions** and multiplies it by the items
+left, discounting at most one gap for the item in flight.
+
+**It is a hint, not a promise**, and five rules keep it honest:
+
+- **Two samples minimum.** One completed item of seven extrapolates ×7 off a
+  single observation, so no ETA renders until the second item lands.
+- **The rate starts at the first completion, not at the list.** Everything before
+  it — planning, reading, waiting on a permission prompt — is session ramp-up, and
+  charging that to every remaining item ran the estimate 5–7× long.
+- **Gaps under five seconds are ignored.** Several rows ticked off in one burst
+  are bookkeeping, not work, and a mean over them collapses the estimate.
+- **A rewritten list re-anchors.** When the model adds or removes items, `total`
+  changes and elapsed time is measured from that new list instead, rather than
+  inheriting a rate earned by a different plan.
+- **No list, no segment.** Sessions with no task list show nothing, and a list
+  whose every item is complete clears rather than sitting at 100% — the bar is
+  there to say how much is left, so it leaves when the answer is "none".
+
+A long single item still stalls a visibly-unmoving bar — the estimate knows how
+many items remain, never how big they are. The pair is off unless
+`CLAUDE_HEALTHLINE_TASK_LINE=1` is set.
+
+The **step** is read from `<CLAUDE_HEALTHLINE_STEP_DIR>/claude-step-<session_id>`
+(default dir `/tmp`). The file holds `<state>\t<label>`, where `state` is
+`running` or `done`, and the segment colours itself accordingly: bright white for
+a tool call in flight, plain white once it has returned. A file with no state
+field is treated as `running`, so a hook that writes only a label still works.
+
+Three hooks maintain it — `PreToolUse` writes `running`, `PostToolUse` rewrites
+the same label as `done`, and `Stop` deletes the file so the row falls back to its
+`· idle` placeholder when the turn ends:
+
+| Event | Action | Row shows |
+|---|---|---|
+| `PreToolUse` | `printf 'running\t%s' "$label" > "$step_file"` | bright-white label |
+| `PostToolUse` | rewrite the label with the `done` state | plain-white label |
+| `Stop` | `rm -f "$step_file"` | dim `· idle` |
+
+## Multi-row layout
+
+Claude Code renders one row per line the command prints. The wide segments — path,
+branch, goal, tool call — are the ones that wrap on a narrow pane, so
+`CLAUDE_HEALTHLINE_ROWS` lifts them off the row carrying the numbers:
+
+| Value | Row 1 | Row 2 | Row 3 |
+|---|---|---|---|
+| `1` (default) | everything | | |
+| `2` | title · dir · branch · progress · todo · step | health · model · context · cost · task · rate · lines | |
+| `3` | title · dir · branch | progress · todo · step | health · model · context · cost · task · rate · lines |
+
+Each row is width-fitted independently. Under `ROWS=3` the todo/step row renders
+`· idle` when neither is present, so the status line keeps its height as tool
+calls start and finish; any other empty row is dropped rather than printed blank.
+Rows cost vertical space in every session, hence the single-row default:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "CLAUDE_HEALTHLINE_ROWS=3 claude-healthline"
+  }
+}
+```
+
 ## Configuration
 
 Every knob is an environment variable, so it composes cleanly with the `command` string.
+
+The task line, the current step, worktree-aware branches, extra rows and the cost
+restyle are **opt-in**: with none of them set the status line renders exactly what
+it rendered before they existed, and a test pins that against the earlier output.
+Each is independent, so any one can be switched on alone.
 
 | Variable | Effect |
 |---|---|
@@ -235,6 +396,24 @@ Every knob is an environment variable, so it composes cleanly with the `command`
 | `CLAUDE_CONFIG_DIR=<path>` | Where the caveman flag files and probe cache live (default `~/.claude`) |
 | `CLAUDE_HEALTHLINE_CN_TTL=<secs>` | Chronis task cache TTL (default `8`) |
 | `CLAUDE_HEALTHLINE_CN_BIN=<path>` | Explicit path to the `cn` binary |
+| `CLAUDE_HEALTHLINE_TASK_LINE=1` | Show the task progress bar, ETA and active item (opt-in; enables the transcript tail scan) |
+| `CLAUDE_HEALTHLINE_TODO_TAIL=<bytes>` | Transcript tail scanned for the newest list (default `4194304`) |
+| `CLAUDE_HEALTHLINE_ROWS=<1-3>` | Rows to render (default `1`) — see [Multi-row layout](#multi-row-layout) |
+| `CLAUDE_HEALTHLINE_STEP=1` | Show the current-step segment (opt-in) |
+| `CLAUDE_HEALTHLINE_STEP_DIR=<path>` | Directory holding `claude-step-<session_id>` files (default `/tmp`) |
+| `CLAUDE_HEALTHLINE_WORKTREE=1` | Read the branch from the worktree in play and name it alongside (opt-in) |
+| `CLAUDE_HEALTHLINE_COST_EMPHASIS=1` | Colour the session cost and let burn rate and today's total recede (opt-in) |
+
+Everything switched on at once:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "CLAUDE_HEALTHLINE_ROWS=3 CLAUDE_HEALTHLINE_TASK_LINE=1 CLAUDE_HEALTHLINE_STEP=1 CLAUDE_HEALTHLINE_WORKTREE=1 CLAUDE_HEALTHLINE_COST_EMPHASIS=1 claude-healthline"
+  }
+}
+```
 
 ## Why it's safe to run on every keystroke
 
@@ -248,7 +427,7 @@ A status line command runs constantly, so claude-healthline is built to be borin
 
 claude-healthline adapts to the width Claude Code reports in `COLUMNS`. When space runs out it degrades gracefully — dropping the lowest-value segments first, then compacting the cost cluster — so **model, context %, and cost never fall off screen** on a half-width pane.
 
-Removal order: `project skills` → `caveman` → `lines±` → `rate limit` → cost `burn`/`today` extras → `repo` → `git branch` → `task`. The three essentials are never dropped — and neither is `mcp`, which only appears when a server actually needs attention.
+Removal order: `project skills` → `caveman` → `lines±` → `rate limit` → cost `burn`/`today` extras → `step` → `repo` → `title` → `git branch` → `task` → `todo` → `progress`. The three essentials are never dropped — and neither is `mcp`, which only appears when a server actually needs attention.
 
 | Terminal width | What stays |
 |---|---|
@@ -315,7 +494,7 @@ The built-in prices are a snapshot (August 2026). When Anthropic changes prices,
 No — this renders it. Point `statusLine.command` at claude-healthline and the caveman level plus its savings figure appear as a segment, read from the same files the plugin already writes. Nothing to install, nothing to wrap, and `CLAUDE_HEALTHLINE_NO_CAVEMAN=1` turns it off. See [Caveman mode](#caveman-mode).
 
 ### What happens on a small or split-screen terminal?
-It adapts to `COLUMNS` and drops the least-important segments first (project skills, then the caveman badge, then lines±, then rate limit, then cost extras, then repo/branch/task), always keeping model, context %, cost — and MCP trouble. So on a half-width pane you still see how full your context is, what the session costs, and whether a server is down. The bottom row of the [preview image](#claude-healthline) is exactly this.
+It adapts to `COLUMNS` and drops the least-important segments first (project skills, then the caveman badge, then lines±, then rate limit, then cost extras, then step/repo/branch/task/todo/progress), always keeping model, context %, cost — and MCP trouble. So on a half-width pane you still see how full your context is, what the session costs, and whether a server is down. The bottom row of the [preview image](#claude-healthline) is exactly this.
 
 ### What is the agent-health segment?
 An optional first segment reporting how the agent is doing across *separate* dimensions — rule-adherence, truthfulness, task-success, stability — with a green/yellow/red verdict, so you can tell instruction drift from hallucination from execution failure at a glance (not one vague "quality" number). It **only displays** scores from a per-session state file and **never invents them**: the bundled `claude-health-hook` fills the observable dimensions (stability + drift) from real tool outcomes; the rest render `–` until an evaluator or the agent writes them. Any safety/critical flag is a hard gate → red. Full schema, rubric, and hook wiring: [docs/agent-health.md](docs/agent-health.md).
