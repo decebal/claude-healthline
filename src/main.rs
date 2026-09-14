@@ -1485,7 +1485,7 @@ fn collect_segments(input: &Input, g: &Glyphs, config: Config) -> Vec<Seg> {
         segs.push(s);
     }
 
-    // 4c. PROGRESS + ETA, then the goal it is measuring
+    // 4c. PROGRESS, then the goal it is measuring
     if config.task_line {
         segs.extend(tasks::task_segs(input.transcript_path.as_deref(), g));
     }

@@ -33,7 +33,7 @@ claude-healthline renders up to fifteen segments, in one to three rows, **each d
 - **MCP trouble** *(optional)* — MCP servers that need re-auth or failed to connect. Draws nothing when the fleet is healthy. See [Skills and MCP servers](#skills-and-mcp-servers).
 - **Task** — the in-progress [chronis](https://github.com/rtk-ai) (`cn`) task in the current directory. Optional; omitted if `cn` or a task isn't found.
 - **Overarching todo** — the in-progress item from the session's task list, so the current goal stays on screen. See [Todo and step segments](#todo-and-step-segments).
-- **Progress + ETA** — how far through the session's task list it is, as a seven-cell bar and a straight-line estimate of the time left. Reads the `TaskCreate`/`TaskUpdate` events current models emit, or an older `TodoWrite` list. See [Progress and ETA](#progress-and-eta).
+- **Progress** — how far through the session's task list it is, as a seven-cell bar that starts empty on a new run and stays full once the run finishes. Reads the `TaskCreate`/`TaskUpdate` events current models emit, or an older `TodoWrite` list. See [Progress](#progress).
 - **Current step** — the tool call in flight, from a state file a `PreToolUse` hook writes.
 - **Rate limit** — 5-hour and 7-day usage windows (shown on Pro/Max plans).
 - **Lines ±** — lines added/removed this session.
@@ -276,13 +276,13 @@ string `"TodoWrite"` — a transcript of this very README, say — is ignored. O
 the trailing `CLAUDE_HEALTHLINE_TODO_TAIL` bytes are scanned, so a long session
 never makes a render expensive.
 
-## Progress and ETA
+## Progress
 
 The same transcript scan that finds the goal also counts the list, so progress
 costs nothing extra:
 
 ```
-▮▮▮▮▯▯▯ ~9m  󰙅 Rendering the bar  ▸ Bash: cargo test
+▮▮▮▮▯▯▯  󰙅 Rendering the bar  ▸ Bash: cargo test
 ```
 
 Two sources, because Claude Code changed tools underneath this:
@@ -306,28 +306,19 @@ CLAUDE_CODE_ENABLE_TODO_TOOLS=1 claude
 ```
 
 The bar fills `completed / total` of live tasks, rounded up over seven cells — a
-real fraction, not a guess, though seven cells is all the precision on offer. The
-ETA takes the **median gap between completions** and multiplies it by the items
-left, discounting at most one gap for the item in flight.
+real fraction, not a guess, though seven cells is all the precision on offer.
+Three rules keep it readable between runs:
 
-**It is a hint, not a promise**, and five rules keep it honest:
+- **A new run starts empty.** A `TaskCreate` arriving once every existing task is
+  complete opens a new run and drops the old one, so a fresh list begins at zero
+  cells instead of inheriting the fill of the work before it. A create landing
+  while anything is still pending or in flight extends the run it is in.
+- **A finished run stays full.** The last completion fills all seven cells and
+  leaves them there, so an idle session reads as "that run is done".
+- **No list, no segment.** A session with no task list shows nothing at all.
 
-- **Two samples minimum.** One completed item of seven extrapolates ×7 off a
-  single observation, so no ETA renders until the second item lands.
-- **The rate starts at the first completion, not at the list.** Everything before
-  it — planning, reading, waiting on a permission prompt — is session ramp-up, and
-  charging that to every remaining item ran the estimate 5–7× long.
-- **Gaps under five seconds are ignored.** Several rows ticked off in one burst
-  are bookkeeping, not work, and a mean over them collapses the estimate.
-- **A rewritten list re-anchors.** When the model adds or removes items, `total`
-  changes and elapsed time is measured from that new list instead, rather than
-  inheriting a rate earned by a different plan.
-- **No list, no segment.** Sessions with no task list show nothing, and a list
-  whose every item is complete clears rather than sitting at 100% — the bar is
-  there to say how much is left, so it leaves when the answer is "none".
-
-A long single item still stalls a visibly-unmoving bar — the estimate knows how
-many items remain, never how big they are. The pair is off unless
+A long single item still stalls a visibly-unmoving bar — the bar knows how many
+items remain, never how big they are. The pair is off unless
 `CLAUDE_HEALTHLINE_TASK_LINE=1` is set.
 
 The **step** is read from `<CLAUDE_HEALTHLINE_STEP_DIR>/claude-step-<session_id>`
@@ -396,7 +387,7 @@ Each is independent, so any one can be switched on alone.
 | `CLAUDE_CONFIG_DIR=<path>` | Where the caveman flag files and probe cache live (default `~/.claude`) |
 | `CLAUDE_HEALTHLINE_CN_TTL=<secs>` | Chronis task cache TTL (default `8`) |
 | `CLAUDE_HEALTHLINE_CN_BIN=<path>` | Explicit path to the `cn` binary |
-| `CLAUDE_HEALTHLINE_TASK_LINE=1` | Show the task progress bar, ETA and active item (opt-in; enables the transcript tail scan) |
+| `CLAUDE_HEALTHLINE_TASK_LINE=1` | Show the task progress bar and active item (opt-in; enables the transcript tail scan) |
 | `CLAUDE_HEALTHLINE_TODO_TAIL=<bytes>` | Transcript tail scanned for the newest list (default `4194304`) |
 | `CLAUDE_HEALTHLINE_ROWS=<1-3>` | Rows to render (default `1`) — see [Multi-row layout](#multi-row-layout) |
 | `CLAUDE_HEALTHLINE_STEP=1` | Show the current-step segment (opt-in) |
