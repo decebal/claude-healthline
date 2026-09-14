@@ -313,8 +313,11 @@ Three rules keep it readable between runs:
   complete opens a new run and drops the old one, so a fresh list begins at zero
   cells instead of inheriting the fill of the work before it. A create landing
   while anything is still pending or in flight extends the run it is in.
-- **A finished run stays full.** The last completion fills all seven cells and
-  leaves them there, so an idle session reads as "that run is done".
+- **A finished run fills, then retires.** The last completion fills all seven
+  cells and holds them for a minute, so the end of a run is visible; after that
+  the bar goes and the row falls back to `· idle`. A completion the transcript
+  never dated is treated as long past, since a bar that cannot age out would sit
+  there full for the rest of the session.
 - **No list, no segment.** A session with no task list shows nothing at all.
 
 A long single item still stalls a visibly-unmoving bar — the bar knows how many
@@ -328,14 +331,14 @@ a tool call in flight, plain white once it has returned. A file with no state
 field is treated as `running`, so a hook that writes only a label still works.
 
 Three hooks maintain it — `PreToolUse` writes `running`, `PostToolUse` rewrites
-the same label as `done`, and `Stop` deletes the file so the segment disappears
-when the turn ends:
+the same label as `done`, and `Stop` deletes the file so the row falls back to its
+`· idle` placeholder when the turn ends:
 
 | Event | Action | Row shows |
 |---|---|---|
 | `PreToolUse` | `printf 'running\t%s' "$label" > "$step_file"` | bright-white label |
 | `PostToolUse` | rewrite the label with the `done` state | plain-white label |
-| `Stop` | `rm -f "$step_file"` | nothing — the row collapses once the bar and goal are gone too |
+| `Stop` | `rm -f "$step_file"` | dim `· idle`, once the bar has retired too |
 
 ## Multi-row layout
 
@@ -349,10 +352,11 @@ branch, goal, tool call — are the ones that wrap on a narrow pane, so
 | `2` | title · dir · branch · progress · todo · step | health · model · context · cost · task · rate · lines | |
 | `3` | title · dir · branch | progress · todo · step | health · model · context · cost · task · rate · lines |
 
-Each row is width-fitted independently, and an empty row is dropped rather than
-printed blank — a session with no task list and no tool call in flight renders two
-rows under `ROWS=3`, not three. Rows cost vertical space in every session, hence
-the single-row default:
+Each row is width-fitted independently. Under `ROWS=3` the progress/todo/step row
+renders `· idle` when none of the three is present, so the status line keeps its
+height as work starts and stops; any other empty row is dropped rather than
+printed blank. Rows cost vertical space in every session, hence the single-row
+default:
 
 ```json
 {

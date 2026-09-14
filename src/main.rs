@@ -1645,18 +1645,20 @@ fn collect_segments(input: &Input, g: &Glyphs, config: Config) -> Vec<Seg> {
 }
 
 /// Splitting on kind (not position) keeps the wide, wrap-prone segments off the
-/// row carrying the numbers. A row with nothing to say is dropped, not held open:
-/// the progress bar already outlives a turn, so a placeholder would only ever
-/// announce that no list exists.
-fn row_specs(rows: usize) -> Vec<&'static [&'static str]> {
+/// row carrying the numbers; a row's placeholder text holds it open so the status
+/// line does not change height as work starts and stops.
+fn row_specs(rows: usize) -> Vec<(&'static [&'static str], Option<&'static str>)> {
     match rows {
         3 => vec![
-            &["title", "repo", "branch", "skills"],
-            &["progress", "todo", "step"],
+            (&["title", "repo", "branch", "skills"], None),
+            (&["progress", "todo", "step"], Some("idle")),
         ],
-        2 => vec![&[
-            "title", "repo", "branch", "skills", "progress", "todo", "step",
-        ]],
+        2 => vec![(
+            &[
+                "title", "repo", "branch", "skills", "progress", "todo", "step",
+            ],
+            None,
+        )],
         _ => vec![],
     }
 }
@@ -1672,13 +1674,15 @@ fn layout_rows(segs: Vec<Seg>, sep: &str, rows: usize) -> String {
     }
     let mut remaining = segs;
     let mut lines: Vec<String> = Vec::new();
-    for kinds in specs {
+    for (kinds, placeholder) in specs {
         let (row, rest): (Vec<Seg>, Vec<Seg>) =
             remaining.into_iter().partition(|s| kinds.contains(&s.kind));
         remaining = rest;
 
         if !row.is_empty() {
             lines.push(fit(row, sep));
+        } else if let Some(text) = placeholder {
+            lines.push(seg(DIM, "\u{00B7}", text));
         }
     }
     if !remaining.is_empty() {
@@ -1932,7 +1936,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_group_by_kind_and_an_empty_row_collapses() {
+    fn rows_group_by_kind_and_hold_their_height() {
         let g = ascii_glyphs();
         let build = |kinds: &[&'static str]| -> Vec<Seg> {
             kinds
@@ -1954,12 +1958,13 @@ mod tests {
         assert!(lines[1].contains("todo") && lines[1].contains("step"));
         assert!(lines[2].contains("model") && lines[2].contains("cost"));
 
-        // No progress, todo or step: that row collapses rather than printing
-        // blank or standing in for work that is not running.
+        // No progress, todo or step: the row holds its height with the placeholder.
         let idle = layout_rows(build(&["model", "repo"]), &g.sep, 3);
-        assert_eq!(idle.lines().count(), 2);
-        assert!(!idle.contains("idle"));
+        let idle_lines: Vec<&str> = idle.lines().collect();
+        assert_eq!(idle_lines.len(), 3);
+        assert!(idle_lines[1].contains("idle"));
 
+        // A row with no placeholder still collapses rather than printing blank.
         let no_repo = layout_rows(build(&["model", "todo"]), &g.sep, 3);
         assert_eq!(no_repo.lines().count(), 2);
 

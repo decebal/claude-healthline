@@ -6,8 +6,8 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::{
-    clean, safe_session_id, step_dir, Glyphs, Seg, BRIGHT_MAGENTA, BRIGHT_WHITE, GREEN, GREY, RESET,
-    WHITE,
+    clean, now_unix, safe_session_id, step_dir, Glyphs, Seg, BRIGHT_MAGENTA, BRIGHT_WHITE, GREEN,
+    GREY, RESET, WHITE,
 };
 
 /// Bounds the tail scan, so a multi-megabyte session cannot make a render
@@ -73,6 +73,37 @@ fn first_str<'a>(map: &'a serde_json::Map<String, Value>, keys: &[&str]) -> Opti
         .find(|value| !value.is_empty())
 }
 
+/// Howard Hinnant's civil->days; the inverse of [`crate::utc_ymd`].
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Unix seconds from a transcript's ISO-8601 `timestamp` (always UTC, `Z`).
+fn parse_iso_secs(stamp: &str) -> Option<i64> {
+    let bytes = stamp.as_bytes();
+    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+        return None;
+    }
+    let field = |from: usize, to: usize| stamp.get(from..to)?.parse::<i64>().ok();
+    let (year, month, day) = (field(0, 4)?, field(5, 7)?, field(8, 10)?);
+    let (hour, minute, second) = (field(11, 13)?, field(14, 16)?, field(17, 19)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+fn line_timestamp(line: &str) -> Option<i64> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    parse_iso_secs(v.get("timestamp")?.as_str()?)
+}
+
 #[derive(Debug, Clone)]
 struct TaskEntry {
     subject: String,
@@ -87,11 +118,12 @@ struct TaskEntry {
 struct TaskFold {
     pending_creates: Vec<(String, TaskEntry)>,
     tasks: Vec<(String, TaskEntry)>,
+    last_completion_secs: Option<i64>,
     saw_events: bool,
 }
 
 impl TaskFold {
-    fn apply_line(&mut self, line: &str) {
+    fn apply_line(&mut self, line: &str, stamp: Option<i64>) {
         let parsed: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(_) => return,
@@ -153,6 +185,8 @@ impl TaskFold {
             self.start_new_run_if_settled();
             self.pending_creates.extend(creates);
         }
+
+        let mut newest_completion = None;
         for (task_id, status, active_form) in updates {
             self.saw_events = true;
             if status.as_deref() == Some("deleted") {
@@ -163,12 +197,21 @@ impl TaskFold {
                 continue;
             };
 
+            let newly_done = status.as_deref() == Some("completed") && entry.status != "completed";
+
             if let Some(status) = status {
                 entry.status = status;
             }
             if active_form.is_some() {
                 entry.active_form = active_form;
             }
+
+            if newly_done {
+                newest_completion = stamp.or(newest_completion);
+            }
+        }
+        if newest_completion.is_some() {
+            self.last_completion_secs = newest_completion;
         }
     }
 
@@ -184,6 +227,7 @@ impl TaskFold {
 
         if settled {
             self.tasks.clear();
+            self.last_completion_secs = None;
         }
     }
 
@@ -200,14 +244,24 @@ impl TaskFold {
             })
             .filter(|label| !label.is_empty());
 
+        let done = self
+            .tasks
+            .iter()
+            .filter(|(_, entry)| entry.status == "completed")
+            .count();
+        let total = self.tasks.len();
+
+        let finished_secs = if total > 0 && done == total {
+            self.last_completion_secs
+        } else {
+            None
+        };
+
         TodoProgress {
             active,
-            done: self
-                .tasks
-                .iter()
-                .filter(|(_, entry)| entry.status == "completed")
-                .count(),
-            total: self.tasks.len(),
+            done,
+            total,
+            finished_secs,
         }
     }
 }
@@ -221,6 +275,14 @@ struct TodoProgress {
     active: Option<String>,
     done: usize,
     total: usize,
+    /// When the run's last item landed, for the grace window the full bar gets.
+    finished_secs: Option<i64>,
+}
+
+impl TodoProgress {
+    fn is_complete(&self) -> bool {
+        self.total > 0 && self.done == self.total
+    }
 }
 
 fn todo_progress_from_line(line: &str) -> Option<TodoProgress> {
@@ -255,10 +317,12 @@ fn todo_progress_from_line(line: &str) -> Option<TodoProgress> {
             .filter(|item| status(item) == "completed")
             .count(),
         total: todos.len(),
+        finished_secs: None,
     })
 }
 
-/// The newest todo list in the transcript's tail window.
+/// The newest todo list in the transcript's tail window, dated at the call that
+/// first showed it complete so the bar can age out.
 fn scan_todo_progress(path: &Path, tail: u64) -> Option<TodoProgress> {
     let file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
@@ -271,6 +335,7 @@ fn scan_todo_progress(path: &Path, tail: u64) -> Option<TodoProgress> {
     }
 
     let mut latest: Option<TodoProgress> = None;
+    let mut finished_at: Option<i64> = None;
     let mut fold = TaskFold::default();
     let mut buf = Vec::new();
     loop {
@@ -286,13 +351,21 @@ fn scan_todo_progress(path: &Path, tail: u64) -> Option<TodoProgress> {
         let task_event = line.contains("\"TaskCreate\"") || line.contains("\"TaskUpdate\"");
         let resolves_create = !fold.pending_creates.is_empty() && line.contains("\"task\"");
         if task_event || resolves_create {
-            fold.apply_line(&line);
+            fold.apply_line(&line, line_timestamp(&line));
         }
 
         if !line.contains("\"TodoWrite\"") {
             continue;
         }
         if let Some(progress) = todo_progress_from_line(&line) {
+            let was_complete = latest.as_ref().is_some_and(TodoProgress::is_complete);
+
+            if !progress.is_complete() {
+                finished_at = None;
+            } else if !was_complete {
+                finished_at = line_timestamp(&line);
+            }
+
             latest = Some(progress);
         }
     }
@@ -303,16 +376,36 @@ fn scan_todo_progress(path: &Path, tail: u64) -> Option<TodoProgress> {
         return Some(fold.progress());
     }
 
-    latest
+    latest.map(|progress| TodoProgress {
+        finished_secs: finished_at,
+        ..progress
+    })
 }
 
 const BAR_CELLS: usize = 7;
 
-/// A list with nothing in it draws nothing. A finished one stays on screen,
-/// full, so an idle session reads as "that run is done" rather than as a session
-/// that never had a list.
-fn progress_worth_showing(progress: &TodoProgress) -> bool {
-    progress.total > 0
+/// How long a finished run holds its full bar before the row falls back to its
+/// placeholder. Long enough to see the run land, short enough that a quiet
+/// session is not still reporting work that ended.
+const FINISHED_GRACE_SECS: i64 = 60;
+
+/// A list with nothing in it draws nothing. A finished one is shown full for
+/// `FINISHED_GRACE_SECS`, then retires.
+fn progress_worth_showing(progress: &TodoProgress, now_secs: i64) -> bool {
+    if progress.total == 0 {
+        return false;
+    }
+    if !progress.is_complete() {
+        return true;
+    }
+
+    // An undated completion is treated as long past: a bar that cannot age out
+    // would sit there full for the rest of the session.
+    let Some(finished) = progress.finished_secs else {
+        return false;
+    };
+
+    now_secs.saturating_sub(finished) <= FINISHED_GRACE_SECS
 }
 
 /// Rounded UP, so any progress at all lights the first cell.
@@ -356,7 +449,7 @@ pub fn task_segs(transcript_path: Option<&str>, g: &Glyphs) -> Vec<Seg> {
 
     let mut segs = Vec::new();
 
-    if progress_worth_showing(&progress) {
+    if progress_worth_showing(&progress, now_unix() as i64) {
         segs.push(progress_bar_seg(&progress));
     }
     if let Some(todo) = progress.active.as_deref() {
@@ -412,10 +505,11 @@ pub fn step_seg(session_id: Option<&str>, g: &Glyphs) -> Option<Seg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utc_ymd;
 
-    fn create_line(call: &str, subject: &str, active: &str) -> String {
+    fn create_line(stamp: &str, call: &str, subject: &str, active: &str) -> String {
         format!(
-            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"{call}","name":"TaskCreate","input":{{"subject":"{subject}","activeForm":"{active}"}}}}]}}}}"#
+            r#"{{"timestamp":"{stamp}","type":"assistant","message":{{"content":[{{"type":"tool_use","id":"{call}","name":"TaskCreate","input":{{"subject":"{subject}","activeForm":"{active}"}}}}]}}}}"#
         )
     }
 
@@ -426,9 +520,9 @@ mod tests {
     }
 
     /// The streamed spelling is whatever the model emitted, hence task_id here.
-    fn update_line(id: &str, status: &str) -> String {
+    fn update_line(stamp: &str, id: &str, status: &str) -> String {
         format!(
-            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"tu_u","name":"TaskUpdate","input":{{"task_id":"{id}","status":"{status}"}}}}]}}}}"#
+            r#"{{"timestamp":"{stamp}","type":"assistant","message":{{"content":[{{"type":"tool_use","id":"tu_u","name":"TaskUpdate","input":{{"task_id":"{id}","status":"{status}"}}}}]}}}}"#
         )
     }
 
@@ -493,16 +587,30 @@ mod tests {
     }
 
     #[test]
-    fn a_run_starts_empty_and_ends_full_rather_than_clearing() {
-        let list = |done: usize, total: usize| TodoProgress {
+    fn a_run_starts_empty_fills_at_the_end_then_retires() {
+        let list = |done: usize, total: usize, finished: Option<i64>| TodoProgress {
             active: None,
             done,
             total,
+            finished_secs: finished,
         };
 
-        assert!(!progress_worth_showing(&list(0, 0)));
-        assert!(progress_worth_showing(&list(0, 7)));
-        assert!(progress_worth_showing(&list(7, 7)));
+        assert!(!progress_worth_showing(&list(0, 0, None), 10_000));
+        assert!(progress_worth_showing(&list(0, 7, None), 10_000));
+        assert!(progress_worth_showing(&list(3, 7, None), 10_000));
+
+        // Full for the grace window, gone once it lapses.
+        assert!(progress_worth_showing(&list(7, 7, Some(10_000)), 10_000));
+        assert!(progress_worth_showing(
+            &list(7, 7, Some(10_000)),
+            10_000 + FINISHED_GRACE_SECS
+        ));
+        assert!(!progress_worth_showing(
+            &list(7, 7, Some(10_000)),
+            10_001 + FINISHED_GRACE_SECS
+        ));
+        // Undated completion cannot age out, so it never shows.
+        assert!(!progress_worth_showing(&list(7, 7, None), 10_000));
 
         assert_eq!(filled_cells(0, 7), 0);
         assert_eq!(filled_cells(7, 7), BAR_CELLS);
@@ -513,18 +621,18 @@ mod tests {
         let path = write_transcript(
             "fold",
             &[
-                create_line("tu_1", "Fold task events", "Folding task events"),
+                create_line("2026-09-07T10:00:00.000Z", "tu_1", "Fold task events", "Folding task events"),
                 created_line("tu_1", "task-1"),
-                create_line("tu_2", "Add the alias", "Adding the alias"),
+                create_line("2026-09-07T10:00:01.000Z", "tu_2", "Add the alias", "Adding the alias"),
                 created_line("tu_2", "task-2"),
-                create_line("tu_3", "Write the tests", "Writing the tests"),
+                create_line("2026-09-07T10:00:02.000Z", "tu_3", "Write the tests", "Writing the tests"),
                 created_line("tu_3", "task-3"),
-                create_line("tu_4", "Drop this one", "Dropping this one"),
+                create_line("2026-09-07T10:00:03.000Z", "tu_4", "Drop this one", "Dropping this one"),
                 created_line("tu_4", "task-4"),
-                update_line("task-1", "completed"),
-                update_line("task-2", "completed"),
-                update_line("task-3", "in_progress"),
-                update_line("task-4", "deleted"),
+                update_line("2026-09-07T10:10:00.000Z", "task-1", "completed"),
+                update_line("2026-09-07T10:20:00.000Z", "task-2", "completed"),
+                update_line("2026-09-07T10:21:00.000Z", "task-3", "in_progress"),
+                update_line("2026-09-07T10:22:00.000Z", "task-4", "deleted"),
                 // A TodoWrite list in the same window must not win over the fold.
                 r#"{"content":[{"type":"tool_use","name":"TodoWrite","input":{"todos":[{"content":"Stale","status":"in_progress"}]}}]}"#.to_string(),
             ],
@@ -533,6 +641,32 @@ mod tests {
         let progress = scan_todo_progress(&path, 1 << 20).expect("progress");
         assert_eq!((progress.done, progress.total), (2, 3));
         assert_eq!(progress.active.as_deref(), Some("Writing the tests"));
+        // Still running, so nothing is dated and the bar cannot age out.
+        assert_eq!(progress.finished_secs, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_finished_run_is_dated_by_its_last_completion() {
+        let path = write_transcript(
+            "finished",
+            &[
+                create_line("2026-09-07T10:00:00.000Z", "tu_1", "First", "Doing first"),
+                created_line("tu_1", "task-1"),
+                create_line("2026-09-07T10:00:01.000Z", "tu_2", "Second", "Doing second"),
+                created_line("tu_2", "task-2"),
+                update_line("2026-09-07T10:10:00.000Z", "task-1", "completed"),
+                update_line("2026-09-07T10:20:00.000Z", "task-2", "completed"),
+            ],
+        );
+
+        let progress = scan_todo_progress(&path, 1 << 20).expect("progress");
+        assert_eq!((progress.done, progress.total), (2, 2));
+        let finished = parse_iso_secs("2026-09-07T10:20:00.000Z").expect("stamp");
+        assert_eq!(progress.finished_secs, Some(finished));
+
+        assert!(progress_worth_showing(&progress, finished + 30));
+        assert!(!progress_worth_showing(&progress, finished + 600));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -541,19 +675,20 @@ mod tests {
         let path = write_transcript(
             "new-run",
             &[
-                create_line("tu_1", "First", "Doing first"),
+                create_line("2026-09-07T10:00:00.000Z", "tu_1", "First", "Doing first"),
                 created_line("tu_1", "task-1"),
-                create_line("tu_2", "Second", "Doing second"),
+                create_line("2026-09-07T10:00:01.000Z", "tu_2", "Second", "Doing second"),
                 created_line("tu_2", "task-2"),
-                update_line("task-1", "completed"),
-                update_line("task-2", "completed"),
-                create_line("tu_3", "Next run", "Starting the next run"),
+                update_line("2026-09-07T10:10:00.000Z", "task-1", "completed"),
+                update_line("2026-09-07T10:20:00.000Z", "task-2", "completed"),
+                create_line("2026-09-07T10:30:00.000Z", "tu_3", "Next run", "Starting the next run"),
                 created_line("tu_3", "task-3"),
             ],
         );
 
         let progress = scan_todo_progress(&path, 1 << 20).expect("progress");
         assert_eq!((progress.done, progress.total), (0, 1));
+        assert_eq!(progress.finished_secs, None);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -562,18 +697,52 @@ mod tests {
         let path = write_transcript(
             "same-run",
             &[
-                create_line("tu_1", "First", "Doing first"),
+                create_line("2026-09-07T10:00:00.000Z", "tu_1", "First", "Doing first"),
                 created_line("tu_1", "task-1"),
-                create_line("tu_2", "Second", "Doing second"),
+                create_line("2026-09-07T10:00:01.000Z", "tu_2", "Second", "Doing second"),
                 created_line("tu_2", "task-2"),
-                update_line("task-1", "completed"),
-                create_line("tu_3", "Third", "Doing third"),
+                update_line("2026-09-07T10:10:00.000Z", "task-1", "completed"),
+                create_line("2026-09-07T10:11:00.000Z", "tu_3", "Third", "Doing third"),
                 created_line("tu_3", "task-3"),
             ],
         );
 
         let progress = scan_todo_progress(&path, 1 << 20).expect("progress");
         assert_eq!((progress.done, progress.total), (1, 3));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_todowrite_list_is_dated_at_the_call_that_completed_it() {
+        let call = |stamp: &str, done: usize, total: usize| {
+            let todos: Vec<String> = (0..total)
+                .map(|index| {
+                    let status = if index < done { "completed" } else { "pending" };
+                    format!(r#"{{"content":"Item {index}","status":"{status}"}}"#)
+                })
+                .collect();
+            format!(
+                r#"{{"timestamp":"{stamp}","content":[{{"type":"tool_use","name":"TodoWrite","input":{{"todos":[{}]}}}}]}}"#,
+                todos.join(",")
+            )
+        };
+        let path = write_transcript(
+            "todowrite-finished",
+            &[
+                call("2026-08-21T12:00:00.000Z", 0, 4),
+                call("2026-08-21T12:10:00.000Z", 2, 4),
+                call("2026-08-21T12:30:00.000Z", 4, 4),
+                // A later render of the same finished list keeps the first stamp.
+                call("2026-08-21T12:40:00.000Z", 4, 4),
+            ],
+        );
+
+        let progress = scan_todo_progress(&path, 1 << 20).expect("progress");
+        assert_eq!((progress.done, progress.total), (4, 4));
+        assert_eq!(
+            progress.finished_secs,
+            parse_iso_secs("2026-08-21T12:30:00.000Z")
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -599,6 +768,16 @@ mod tests {
         let progress = scan_todo_progress(&path, 1 << 20).expect("progress");
         assert_eq!((progress.done, progress.total), (3, 6));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn iso_timestamps_round_trip_against_the_daily_cost_date() {
+        let secs = parse_iso_secs("2026-08-21T12:01:00.000Z").expect("parsed");
+        assert_eq!(utc_ymd(secs), "2026-08-21");
+        assert_eq!(secs % 86_400, 12 * 3_600 + 60);
+        assert_eq!(parse_iso_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert!(parse_iso_secs("2026-13-01T00:00:00Z").is_none());
+        assert!(parse_iso_secs("not-a-timestamp").is_none());
     }
 
     #[test]
