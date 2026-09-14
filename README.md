@@ -328,14 +328,14 @@ a tool call in flight, plain white once it has returned. A file with no state
 field is treated as `running`, so a hook that writes only a label still works.
 
 Three hooks maintain it — `PreToolUse` writes `running`, `PostToolUse` rewrites
-the same label as `done`, and `Stop` deletes the file so the row falls back to its
-`· idle` placeholder when the turn ends:
+the same label as `done`, and `Stop` deletes the file so the segment disappears
+when the turn ends:
 
 | Event | Action | Row shows |
 |---|---|---|
 | `PreToolUse` | `printf 'running\t%s' "$label" > "$step_file"` | bright-white label |
 | `PostToolUse` | rewrite the label with the `done` state | plain-white label |
-| `Stop` | `rm -f "$step_file"` | dim `· idle` |
+| `Stop` | `rm -f "$step_file"` | nothing — the row collapses once the bar and goal are gone too |
 
 ## Multi-row layout
 
@@ -349,10 +349,10 @@ branch, goal, tool call — are the ones that wrap on a narrow pane, so
 | `2` | title · dir · branch · progress · todo · step | health · model · context · cost · task · rate · lines | |
 | `3` | title · dir · branch | progress · todo · step | health · model · context · cost · task · rate · lines |
 
-Each row is width-fitted independently. Under `ROWS=3` the todo/step row renders
-`· idle` when neither is present, so the status line keeps its height as tool
-calls start and finish; any other empty row is dropped rather than printed blank.
-Rows cost vertical space in every session, hence the single-row default:
+Each row is width-fitted independently, and an empty row is dropped rather than
+printed blank — a session with no task list and no tool call in flight renders two
+rows under `ROWS=3`, not three. Rows cost vertical space in every session, hence
+the single-row default:
 
 ```json
 {
