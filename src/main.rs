@@ -8,7 +8,7 @@
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -363,29 +363,29 @@ type CnOutcome = Option<Option<String>>;
 /// yields no task id, retry with the hyphen form — all inside the single wall
 /// clock budget. Under no input may this block longer than `CN_WAIT_MS`.
 fn run_cn_bounded(cwd: &str) -> CnOutcome {
-    use std::sync::mpsc;
-
-    let (tx, rx) = mpsc::channel();
-    let cwd_owned = cwd.to_string();
-    std::thread::spawn(move || {
-        let payload = cn_list_first_hit(&cwd_owned);
-        let _ = tx.send(payload);
-    });
-
-    // Timeout / disconnect -> None (CnOutcome default): fall back to the stale
-    // cache; the detached thread is left to exit on its own.
-    rx.recv_timeout(Duration::from_millis(CN_WAIT_MS))
-        .unwrap_or_default()
+    // The budget is enforced by whoever owns the child, so the child can be
+    // KILLED when it expires. A worker thread cannot do that: it blocks inside
+    // `Command::output()`, which waits on the child, and abandoning the thread
+    // abandons the process. The statusline host then kills this binary, the
+    // thread dies with it, and `cn` is reparented to init and keeps running.
+    //
+    // Measured 2026-08-31: nine such orphans at PPID 1, the oldest 88s, for a
+    // query that takes ~1s. Two per render, because two filter spellings are
+    // tried. Nothing reaped them and each render added more.
+    cn_list_first_hit(cwd, Instant::now() + Duration::from_millis(CN_WAIT_MS))
 }
 
 /// Run `cn list --status=<filter> --toon` for each candidate filter spelling.
 /// Returns `None` if `cn` never ran successfully for any spelling; otherwise
 /// `Some(<task id or None>)` from the first successful invocation that had a
 /// task (preferring a hit, else the last clean-but-empty response).
-fn cn_list_first_hit(cwd: &str) -> CnOutcome {
+fn cn_list_first_hit(cwd: &str, deadline: Instant) -> CnOutcome {
     let mut ran_clean_empty = false;
     for filter in ["in_progress", "in-progress"] {
-        if let Some(out) = cn_list_once(cwd, filter) {
+        // One shared deadline across both spellings, not one each: the caller
+        // is a statusline render, and two budgets would let a slow `cn` cost
+        // twice what the constant promises.
+        if let Some(out) = cn_list_once(cwd, filter, deadline) {
             if let Some(id) = parse_task_id(&out) {
                 return Some(Some(id));
             }
@@ -399,21 +399,49 @@ fn cn_list_first_hit(cwd: &str) -> CnOutcome {
     }
 }
 
-fn cn_list_once(cwd: &str, filter: &str) -> Option<String> {
+/// Run one `cn list` and return its stdout, or `None` on failure or timeout.
+///
+/// Owns the child for its whole life: on expiry it is killed AND reaped, so
+/// this function never leaves a process behind. That is the whole point — see
+/// [`run_cn_bounded`].
+fn cn_list_once(cwd: &str, filter: &str, deadline: Instant) -> Option<String> {
     use std::process::{Command, Stdio};
     let arg = format!("--status={filter}");
-    let out = Command::new(cn_bin())
+    let mut child = Command::new(cn_bin())
         .args(["list", &arg, "--toon"])
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .spawn()
         .ok()?;
-    if out.status.success() {
-        Some(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        None
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let mut out = String::new();
+                child.stdout.take()?.read_to_string(&mut out).ok()?;
+                return Some(out);
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Kill THEN wait. Without the wait the child becomes a
+                    // zombie instead of an orphan — a different leak, not a fix.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
     }
 }
 
@@ -1974,5 +2002,50 @@ mod tests {
         }
         assert!(project_skills_dir(Some("/tmp/some-repo")).is_some());
         assert_eq!(project_skills_dir(None), None);
+    }
+
+    /// The regression this pins: 0.1.0 ran `cn` on a worker thread and
+    /// abandoned it at the deadline. `recv_timeout` returned, but the thread
+    /// was still inside `Command::output()` holding the child, so the child
+    /// outlived this process and reparented to init. Measured 2026-08-31: nine
+    /// orphans at PPID 1. The same shape, unfixed, cost ~810% CPU on
+    /// 2026-09-18 — which is when the fix finally shipped.
+    #[cfg(unix)]
+    #[test]
+    fn a_cn_that_outruns_its_budget_is_killed_and_reaped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Unique per test process: the assertion below looks for this name in
+        // the live process table, and a stale copy would fail it for free.
+        let marker = format!("slow-cn-{}", std::process::id());
+        let dir = std::env::temp_dir().join(&marker);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join(&marker);
+        std::fs::write(&script, "#!/bin/sh\nsleep 10\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        std::env::set_var("CLAUDE_HEALTHLINE_CN_BIN", &script);
+        let started = Instant::now();
+        let outcome = run_cn_bounded(dir.to_str().unwrap());
+        let elapsed = started.elapsed();
+        std::env::remove_var("CLAUDE_HEALTHLINE_CN_BIN");
+
+        assert!(outcome.is_none(), "a cn that never answered has no outcome");
+        assert!(
+            elapsed < Duration::from_millis(CN_WAIT_MS * 3),
+            "both filter spellings share ONE budget, not one each: {elapsed:?}"
+        );
+
+        let ps = std::process::Command::new("/bin/ps")
+            .args(["-Ao", "args"])
+            .output()
+            .unwrap();
+        let table = String::from_utf8_lossy(&ps.stdout);
+        assert!(
+            !table.contains(&marker),
+            "the cn child outlived its owner — the orphan is back"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

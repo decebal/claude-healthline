@@ -1,6 +1,6 @@
 [package]
 name = "claude-healthline"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A fast, never-blank Claude Code status line that tells you when your agent is going wrong: agent-health score, MCP servers needing attention, context %, and live spend."
 license = "MIT"
