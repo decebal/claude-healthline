@@ -91,3 +91,39 @@ jobs:
             claude-healthline-${{ matrix.target }}.zip
             claude-healthline-${{ matrix.target }}.zip.sha256
           fail_on_unmatched_files: false
+
+  # crates.io Trusted Publishing: the job trades a GitHub OIDC token for a
+  # short-lived crates.io token, so no registry secret is stored. crates.io
+  # accepts it only from this repository and this workflow file, as configured
+  # under the crate's Settings > Trusted Publishing.
+  publish:
+    name: crates.io
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      # A tag whose Cargo.toml version differs would publish the wrong number.
+      - name: Tag matches the crate version
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          test "v$version" = "$TAG" || { echo "::error::tag $TAG but Cargo.toml says $version"; exit 1; }
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - name: Publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
