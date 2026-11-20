@@ -87,6 +87,8 @@ struct RateLimits {
     five_hour: Option<Bucket>,
     #[serde(default)]
     seven_day: Option<Bucket>,
+    #[serde(default)]
+    spend_limit: Option<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1345,6 +1347,38 @@ fn fit_within(mut segs: Vec<Seg>, sep: &str, cols: Option<usize>) -> String {
         .join(sep)
 }
 
+/// Whether to draw the cost cluster. On a subscription the dollars are a
+/// list-price estimate nobody is billed; only per-token billing (an API key, a
+/// cloud provider, a gateway spend limit) makes them real.
+///
+/// The stdin JSON has no auth field. Claude Code sends the 5h/7d `rate_limits`
+/// windows only to claude.ai subscribers, so their presence means subscription.
+/// They are absent before the first response, so the fallback is the
+/// environment Claude Code hands its status line. `CLAUDE_HEALTHLINE_COST` =
+/// `show` / `hide` overrides both.
+fn show_cost(input: &Input, env: impl Fn(&str) -> Option<String>) -> bool {
+    match env("CLAUDE_HEALTHLINE_COST").as_deref().map(str::trim) {
+        Some("show") => return true,
+        Some("hide") => return false,
+        _ => {}
+    }
+    if let Some(rl) = input.rate_limits.as_ref() {
+        if rl.five_hour.is_some() || rl.seven_day.is_some() {
+            return false;
+        }
+        if rl.spend_limit.is_some() {
+            return true;
+        }
+    }
+    let set = |k: &str| env(k).is_some_and(|v| !v.trim().is_empty());
+    let on = |k: &str| env(k).is_some_and(|v| matches!(v.trim(), "1" | "true"));
+    set("ANTHROPIC_API_KEY")
+        || set("ANTHROPIC_AUTH_TOKEN")
+        || on("CLAUDE_CODE_USE_BEDROCK")
+        || on("CLAUDE_CODE_USE_VERTEX")
+        || on("CLAUDE_CODE_USE_FOUNDRY")
+}
+
 fn render(input: &Input, g: &Glyphs) -> String {
     let mut segs: Vec<Seg> = Vec::new();
 
@@ -1451,54 +1485,56 @@ fn render(input: &Input, g: &Glyphs) -> String {
         segs.push(Seg::new("context", BOLD_RED, g.context, &text));
     }
 
-    // 6. COST
-    let mut cost = input
-        .cost
-        .as_ref()
-        .and_then(|c| c.total_cost_usd)
-        .unwrap_or(0.0);
-    if !cost.is_finite() || cost < 0.0 {
-        cost = 0.0;
-    }
-    let mut parts: Vec<String> = vec![if cost >= 100_000.0 {
-        "$99999+".to_string()
-    } else {
-        format!("${cost:.2}")
-    }];
-    // Burn rate ($/hr): session cost over elapsed wall time (stdin only).
-    let dur_ms = input
-        .cost
-        .as_ref()
-        .and_then(|c| c.total_duration_ms)
-        .unwrap_or(0.0);
-    if cost > 0.0 && dur_ms >= 60_000.0 {
-        let per_hr = cost / (dur_ms / 3_600_000.0);
-        if per_hr.is_finite() && per_hr > 0.0 {
-            parts.push(if per_hr >= 100.0 {
-                format!("~${per_hr:.0}/hr")
+    // 6. COST — only when the session is billed per token.
+    if show_cost(input, |k| std::env::var(k).ok()) {
+        let mut cost = input
+            .cost
+            .as_ref()
+            .and_then(|c| c.total_cost_usd)
+            .unwrap_or(0.0);
+        if !cost.is_finite() || cost < 0.0 {
+            cost = 0.0;
+        }
+        let mut parts: Vec<String> = vec![if cost >= 100_000.0 {
+            "$99999+".to_string()
+        } else {
+            format!("${cost:.2}")
+        }];
+        // Burn rate ($/hr): session cost over elapsed wall time (stdin only).
+        let dur_ms = input
+            .cost
+            .as_ref()
+            .and_then(|c| c.total_duration_ms)
+            .unwrap_or(0.0);
+        if cost > 0.0 && dur_ms >= 60_000.0 {
+            let per_hr = cost / (dur_ms / 3_600_000.0);
+            if per_hr.is_finite() && per_hr > 0.0 {
+                parts.push(if per_hr >= 100.0 {
+                    format!("~${per_hr:.0}/hr")
+                } else {
+                    format!("~${per_hr:.2}/hr")
+                });
+            }
+        }
+        // Today's total across all sessions (computed from transcript usage).
+        if let Some(d) = daily_cost() {
+            parts.push(if d >= 100_000.0 {
+                "today $99999+".to_string()
             } else {
-                format!("~${per_hr:.2}/hr")
+                format!("today ${d:.2}")
             });
         }
+        let full_text = parts.join(" \u{00B7} ");
+        let mut cost_seg = Seg::new("cost", DIM_GREEN, g.cost, &full_text);
+        if parts.len() > 1 {
+            // Narrow terminals collapse the cluster to just the session cost.
+            cost_seg.compact = Some((
+                g.cost.chars().count() + 1 + parts[0].chars().count(),
+                seg(DIM_GREEN, g.cost, &parts[0]),
+            ));
+        }
+        segs.push(cost_seg);
     }
-    // Today's total across all sessions (computed from transcript usage).
-    if let Some(d) = daily_cost() {
-        parts.push(if d >= 100_000.0 {
-            "today $99999+".to_string()
-        } else {
-            format!("today ${d:.2}")
-        });
-    }
-    let full_text = parts.join(" \u{00B7} ");
-    let mut cost_seg = Seg::new("cost", DIM_GREEN, g.cost, &full_text);
-    if parts.len() > 1 {
-        // Narrow terminals collapse the cluster to just the session cost.
-        cost_seg.compact = Some((
-            g.cost.chars().count() + 1 + parts[0].chars().count(),
-            seg(DIM_GREEN, g.cost, &parts[0]),
-        ));
-    }
-    segs.push(cost_seg);
 
     // 6b. MCP TROUBLE — renders nothing when the fleet is healthy, so its mere
     // presence is the signal. Never dropped for width: it only ever appears
@@ -1613,6 +1649,82 @@ mod tests {
             score,
             flag: Some(flag),
         }
+    }
+
+    fn input(json: &str) -> Input {
+        serde_json::from_str(json).unwrap()
+    }
+
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    const SUBSCRIBER: &str = r#"{"cost":{"total_cost_usd":0.53},
+        "rate_limits":{"five_hour":{"used_percentage":28},"seven_day":{"used_percentage":8}}}"#;
+
+    #[test]
+    fn a_subscription_shows_no_spend() {
+        assert!(!show_cost(&input(SUBSCRIBER), env(&[])));
+        // A key in the environment does not bill a session claude.ai serves.
+        assert!(!show_cost(
+            &input(SUBSCRIBER),
+            env(&[("ANTHROPIC_API_KEY", "sk-test")])
+        ));
+    }
+
+    #[test]
+    fn no_billing_signal_shows_no_spend() {
+        assert!(!show_cost(
+            &input(r#"{"cost":{"total_cost_usd":1.0}}"#),
+            env(&[])
+        ));
+        assert!(!show_cost(
+            &input("{}"),
+            env(&[("ANTHROPIC_API_KEY", " "), ("CLAUDE_CODE_USE_BEDROCK", "0")])
+        ));
+    }
+
+    #[test]
+    fn per_token_billing_shows_spend() {
+        let api = input(r#"{"cost":{"total_cost_usd":1.0}}"#);
+        for pair in [
+            ("ANTHROPIC_API_KEY", "sk-test"),
+            ("ANTHROPIC_AUTH_TOKEN", "tok"),
+            ("CLAUDE_CODE_USE_BEDROCK", "1"),
+            ("CLAUDE_CODE_USE_VERTEX", "true"),
+            ("CLAUDE_CODE_USE_FOUNDRY", "1"),
+        ] {
+            assert!(show_cost(&api, env(&[pair])), "{pair:?}");
+        }
+        let gateway = input(r#"{"rate_limits":{"spend_limit":{"used_percentage":63}}}"#);
+        assert!(show_cost(&gateway, env(&[])));
+    }
+
+    #[test]
+    fn the_override_wins_both_ways() {
+        assert!(show_cost(
+            &input(SUBSCRIBER),
+            env(&[("CLAUDE_HEALTHLINE_COST", "show")])
+        ));
+        assert!(!show_cost(
+            &input("{}"),
+            env(&[
+                ("CLAUDE_HEALTHLINE_COST", "hide"),
+                ("ANTHROPIC_API_KEY", "sk-test")
+            ])
+        ));
+    }
+
+    #[test]
+    fn a_subscriber_render_has_no_dollar_sign() {
+        let line = render(&input(SUBSCRIBER), &ascii_glyphs());
+        assert!(!line.contains('$'), "{line}");
+        assert!(line.contains("5h 28%"), "{line}");
     }
 
     #[test]

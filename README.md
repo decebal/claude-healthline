@@ -5,7 +5,7 @@
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
 [![For Claude Code](https://img.shields.io/badge/for-Claude%20Code-6f42c1.svg)](https://code.claude.com/docs/en/statusline)
 
-**claude-healthline is a fast, dependency-light Rust status line for [Claude Code](https://code.claude.com/docs/en/statusline).** It turns the JSON that Claude Code streams on stdin into a single powerline row showing your model, git branch, color-coded context-window usage, live spend (session cost, per-hour burn rate, today's total across every session), an optional multi-dimensional **[agent-health](#agent-health-score)** readout, and the **[MCP servers that need your attention](#skills-and-mcp-servers)** — and it **never blanks, hangs, or panics**, whatever the session sends it.
+**claude-healthline is a fast, dependency-light Rust status line for [Claude Code](https://code.claude.com/docs/en/statusline).** It turns the JSON that Claude Code streams on stdin into a single powerline row showing your model, git branch, color-coded context-window usage, live spend when you pay per token (session cost, per-hour burn rate, today's total across every session), an optional multi-dimensional **[agent-health](#agent-health-score)** readout, and the **[MCP servers that need your attention](#skills-and-mcp-servers)** — and it **never blanks, hangs, or panics**, whatever the session sends it.
 
 ![claude-healthline status bar preview: the same status line in three states — everyday, trouble, and a half-width pane](docs/statusline.svg)
 
@@ -28,7 +28,7 @@ claude-healthline renders up to twelve segments in one line, **each drawn only w
 - **Git branch** — read straight from `.git/HEAD` with **no `git` subprocess**; handles worktrees and detached HEAD.
 - **Project skills** *(optional)* — how many skills the current checkout ships in `.claude/skills/`. See [Skills and MCP servers](#skills-and-mcp-servers).
 - **Context %** — green `<50`, yellow `50–80`, **bold red `>80`** or when `exceeds_200k_tokens` trips.
-- **Cost cluster** — `session · ~$/hr burn · today's total` (see below).
+- **Cost cluster** — `session · ~$/hr burn · today's total`, only when the session bills per token (see below).
 - **MCP trouble** *(optional)* — MCP servers that need re-auth or failed to connect. Draws nothing when the fleet is healthy. See [Skills and MCP servers](#skills-and-mcp-servers).
 - **Task** — the in-progress [chronis](https://github.com/rtk-ai) (`cn`) task in the current directory. Optional; omitted if `cn` or a task isn't found.
 - **Rate limit** — 5-hour and 7-day usage windows (shown on Pro/Max plans).
@@ -76,7 +76,21 @@ That covers every segment above except two, each of which needs a hook to feed i
 
 ## Cost, burn rate, and today's spend
 
-The cost cluster answers "what is this session costing me, and how much have I spent today?" in one place. Session cost and the per-hour burn rate come directly from Claude Code's stdin JSON; today's total is computed the way [ccusage](https://ccusage.com/guide/statusline) does it.
+The cost cluster answers "what is this session costing me, and how much have I spent today?" in one place.
+
+**It only draws when the dollars are real.** On a claude.ai subscription (Pro, Max, Team, Ultra) the figure is a list-price estimate nobody is billed, so the cluster is hidden. Claude Code's stdin carries no auth field, so the line decides from what it does carry:
+
+| Signal | Cost cluster |
+|---|---|
+| `CLAUDE_HEALTHLINE_COST=show` / `hide` | shown / hidden, whatever else is true |
+| `rate_limits.five_hour` or `seven_day` present (Claude Code sends these only to claude.ai subscribers) | hidden |
+| `rate_limits.spend_limit` present (a Claude apps gateway spend limit) | shown |
+| `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` set, or `CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` / `_FOUNDRY` = `1` | shown |
+| none of the above | hidden |
+
+An API key added through `/login` lives in the keychain, not the environment, so it reads as "none of the above": set `CLAUDE_HEALTHLINE_COST=show` for that setup. When the cluster is hidden the transcript scan behind today's total does not run.
+
+Session cost and the per-hour burn rate come directly from Claude Code's stdin JSON; today's total is computed the way [ccusage](https://ccusage.com/guide/statusline) does it.
 
 Claude Code transcripts record `costUSD: null` on every line, so **today's total is derived, not read**: claude-healthline sums today's token `usage` across `~/.claude/projects/**/*.jsonl` and multiplies by a per-model price table. Prices are per-million tokens (August 2026); cache rates follow Anthropic's published ratios — cache read `0.10×` input, 5-minute cache write `1.25×`, 1-hour cache write `2.0×`.
 
@@ -223,6 +237,7 @@ Every knob is an environment variable, so it composes cleanly with the `command`
 | Variable | Effect |
 |---|---|
 | `CLAUDE_HEALTHLINE_ASCII=1` (or `NERD_FONT=0`) | Plain-text labels instead of Nerd-Font glyphs (colors kept) |
+| `CLAUDE_HEALTHLINE_COST=show` / `hide` | Force the cost cluster on or off (default: on only for per-token billing, see [Cost](#cost-burn-rate-and-todays-spend)) |
 | `CLAUDE_HEALTHLINE_NO_DAILY=1` | Skip the transcript scan (drops the `today $…` figure) |
 | `CLAUDE_HEALTHLINE_NO_HEALTH=1` | Hide the agent-health segment |
 | `CLAUDE_HEALTHLINE_HEALTH_DIR=<path>` | Override the health state-file dir |
@@ -246,7 +261,7 @@ A status line command runs constantly, so claude-healthline is built to be borin
 
 ## Narrow and split-screen terminals
 
-claude-healthline adapts to the width Claude Code reports in `COLUMNS`. When space runs out it degrades gracefully — dropping the lowest-value segments first, then compacting the cost cluster — so **model, context %, and cost never fall off screen** on a half-width pane.
+claude-healthline adapts to the width Claude Code reports in `COLUMNS`. When space runs out it degrades gracefully — dropping the lowest-value segments first, then compacting the cost cluster — so **model, context %, and cost (when it is shown) never fall off screen** on a half-width pane.
 
 Removal order: `project skills` → `caveman` → `lines±` → `rate limit` → cost `burn`/`today` extras → `repo` → `git branch` → `task`. The three essentials are never dropped — and neither is `mcp`, which only appears when a server actually needs attention.
 
