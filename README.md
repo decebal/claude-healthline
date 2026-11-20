@@ -337,7 +337,17 @@ An optional first segment reporting how the agent is doing across *separate* dim
 
 ## Contributing
 
-Issues and PRs welcome. `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo build --release` should all be clean.
+Issues and PRs welcome. `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets` and `cargo build --release` should all be clean.
+
+`main` takes rebase merges only, so every commit on a PR lands as it is. Each author collapses their own work to one commit before review; the `single-commit` check fails otherwise. On a PR you wrote alone:
+
+```bash
+git reset --soft "$(git merge-base origin/main HEAD)"
+git commit
+git push --force-with-lease
+```
+
+Amend for follow-up fixes. To contribute to someone else's PR, add your own commit on top and leave theirs alone. A `Co-Authored-By` trailer does not count as a second author.
 
 ## License
 
