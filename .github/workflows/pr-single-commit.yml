@@ -1,0 +1,51 @@
+name: PR Single Commit
+
+# main merges by rebase only, so every commit on a PR branch lands as-is.
+# One PR = one commit per author: each contributor collapses their own work
+# before review, and nobody rewrites another author's commit to satisfy the
+# check. A solo PR is exactly one commit:
+#   git reset --soft "$(git merge-base origin/main HEAD)" && git commit
+# and push with --force-with-lease.
+#
+# The job keeps the name `single-commit`: branch protection requires it by name.
+
+on:
+  pull_request:
+    # `edited` covers a base-branch change, which alters the commit count
+    # without a `synchronize` event.
+    types: [opened, reopened, synchronize, edited]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  single-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require one commit per author
+        # Explicit `bash` runs with -eo pipefail. The default shell has no
+        # pipefail, and a failed `gh api` page prints its error JSON to stdout,
+        # which counts as one "author" and passes the check.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          # An author is the linked GitHub account, or the commit email when
+          # none is linked. Co-authored-by trailers do not count.
+          counts=$(gh api --paginate "repos/$REPO/pulls/$PR/commits" \
+            --jq '.[] | (.author.login // .commit.author.email)' |
+            sort | uniq -c | sort -rn)
+          echo "Commits per author:"
+          echo "$counts"
+          over=$(echo "$counts" | awk '$1 > 1')
+          if [ -n "$over" ]; then
+            while read -r n who; do
+              echo "::error title=Squash before merge::$who has $n commits on this PR; main takes one commit per author. Collapse your own commits (git rebase onto the other authors' commits, or git reset --soft if you are the only author) and push with --force-with-lease"
+            done <<< "$over"
+            exit 1
+          fi
+          echo "OK: one commit per author"
