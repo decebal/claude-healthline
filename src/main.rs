@@ -13,6 +13,12 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::Deserialize;
 use serde_json::Value;
 
+mod config;
+mod tasks;
+mod worktree;
+
+use config::{Billing, Config};
+
 // ---------------------------------------------------------------------------
 // STDIN schema — every field optional, parsed defensively.
 // ---------------------------------------------------------------------------
@@ -24,9 +30,15 @@ struct Input {
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
+    session_name: Option<String>,
+    #[serde(default)]
+    transcript_path: Option<String>,
+    #[serde(default)]
     model: Option<Model>,
     #[serde(default)]
     workspace: Option<Workspace>,
+    #[serde(default)]
+    worktree: Option<WorktreeSession>,
     #[serde(default)]
     cost: Option<Cost>,
     #[serde(default)]
@@ -57,6 +69,16 @@ struct Workspace {
 struct Repo {
     #[serde(default)]
     name: Option<String>,
+}
+
+/// A session writing into a worktree that `cwd` may not be inside — Claude Code
+/// sends this for `--worktree` and hook-based worktree sessions only.
+#[derive(Debug, Default, Deserialize)]
+struct WorktreeSession {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -103,7 +125,12 @@ struct Bucket {
 
 const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[2m";
+const WHITE: &str = "\x1b[37m";
+const GREY: &str = "\x1b[90m";
 const DIM_CYAN: &str = "\x1b[2;36m";
+const BRIGHT_MAGENTA: &str = "\x1b[95m";
+const BRIGHT_CYAN: &str = "\x1b[96m";
+const BRIGHT_WHITE: &str = "\x1b[97m";
 const DIM_MAGENTA: &str = "\x1b[2;35m";
 const GREEN: &str = "\x1b[32m";
 const DIM_GREEN: &str = "\x1b[2;32m";
@@ -121,9 +148,14 @@ struct Glyphs {
     caveman: &'static str,   // U+26CF  pickaxe (caveman compression mode)
     repo: &'static str,      // U+F07B  folder
     branch: &'static str,    // U+E0A0  powerline branch
+    worktree: &'static str,  // U+F126  code fork (linked worktree, not main tree)
+    tree: &'static str,      // U+F1BB  evergreen tree (branch → worktree separator)
+    title: &'static str,     // U+F02B  tag (session name)
     context: &'static str,   // U+F0626 gauge
     cost: &'static str,      // U+F0117 cash
     task: &'static str,      // U+F0139 checklist
+    todo: &'static str,      // U+F0AE  tasks list (TodoWrite in-progress item)
+    step: &'static str,      // U+25B8  small right triangle (current tool call)
     ratelimit: &'static str, // U+F017  clock
     lines: &'static str,     // U+F0DEB plus-minus
     warning: &'static str,   // U+F071  warning triangle
@@ -139,9 +171,14 @@ fn nerd_glyphs() -> Glyphs {
         caveman: "\u{26CF}",
         repo: "\u{F07B}",
         branch: "\u{E0A0}",
+        worktree: "\u{F126}",
+        tree: "\u{F1BB}",
+        title: "\u{F02B}",
         context: "\u{F0626}",
         cost: "\u{F0117}",
         task: "\u{F0139}",
+        todo: "\u{F0AE}",
+        step: "\u{25B8}",
         ratelimit: "\u{F017}",
         lines: "\u{F0DEB}",
         warning: "\u{F071}",
@@ -158,9 +195,14 @@ fn ascii_glyphs() -> Glyphs {
         caveman: "cave",
         repo: "dir",
         branch: "git",
+        worktree: "wt",
+        tree: "in",
+        title: "session",
         context: "ctx",
         cost: "cost",
         task: "task",
+        todo: "todo",
+        step: ">",
         ratelimit: "rate",
         lines: "lines",
         warning: "!",
@@ -949,14 +991,7 @@ fn read_health(session_id: Option<&str>) -> Option<HealthState> {
     if matches!(std::env::var("CLAUDE_HEALTHLINE_NO_HEALTH"), Ok(v) if v == "1") {
         return None;
     }
-    let sid = session_id?.trim();
-    if sid.is_empty()
-        || !sid
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return None; // guard the path join against traversal / junk
-    }
+    let sid = safe_session_id(session_id)?;
     let path = health_dir()?.join(format!("{sid}.json"));
     let fresh = std::fs::metadata(&path)
         .ok()
@@ -1090,6 +1125,34 @@ fn render_health(h: &HealthState, g: &Glyphs) -> Option<Seg> {
         ));
     }
     Some(sg)
+}
+
+// ---------------------------------------------------------------------------
+// Hook state files, shared by the task and worktree modules.
+//
+// The step dir defaults to literally /tmp — NOT std::env::temp_dir(), which on
+// macOS is the per-user $TMPDIR — because that is where the PreToolUse shell
+// hooks write.
+// ---------------------------------------------------------------------------
+
+/// Rejects anything unsafe to interpolate into a path (traversal / junk).
+fn safe_session_id(session_id: Option<&str>) -> Option<String> {
+    let sid = session_id?.trim();
+    if sid.is_empty()
+        || !sid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(sid.to_string())
+}
+
+fn step_dir() -> PathBuf {
+    match std::env::var("CLAUDE_HEALTHLINE_STEP_DIR") {
+        Ok(d) if !d.trim().is_empty() => PathBuf::from(d),
+        _ => PathBuf::from("/tmp"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1335,7 +1398,11 @@ fn fit_within(mut segs: Vec<Seg>, sep: &str, cols: Option<usize>) -> String {
                 }
             }
         }
-        for kind in ["repo", "branch", "task"] {
+        // The goal is the widest item on its row, so it goes before the bar it
+        // labels; a compact bar alone still says how far along the session is.
+        for kind in [
+            "step", "repo", "title", "branch", "task", "todo", "progress",
+        ] {
             if width(&segs) > cols {
                 segs.retain(|s| s.kind != kind);
             }
@@ -1347,6 +1414,25 @@ fn fit_within(mut segs: Vec<Seg>, sep: &str, cols: Option<usize>) -> String {
         .join(sep)
 }
 
+/// Session cost carries the colour; burn rate and today's total recede, so the
+/// figure being watched reads first.
+fn emphasised_cost_seg(g: &Glyphs, parts: &[String]) -> Seg {
+    let mut styled = seg(GREEN, g.cost, &parts[0]);
+
+    for extra in &parts[1..] {
+        styled.push_str(&format!("{GREY} \u{00B7} {extra}{RESET}"));
+    }
+
+    let plain_text = parts.join(" \u{00B7} ");
+
+    Seg {
+        kind: "cost",
+        plain: g.cost.chars().count() + 1 + plain_text.chars().count(),
+        styled,
+        compact: None,
+    }
+}
+
 /// Whether to draw the cost cluster. On a subscription the dollars are a
 /// list-price estimate nobody is billed; only per-token billing (an API key, a
 /// cloud provider, a gateway spend limit) makes them real.
@@ -1354,13 +1440,11 @@ fn fit_within(mut segs: Vec<Seg>, sep: &str, cols: Option<usize>) -> String {
 /// The stdin JSON has no auth field. Claude Code sends the 5h/7d `rate_limits`
 /// windows only to claude.ai subscribers, so their presence means subscription.
 /// They are absent before the first response, so the fallback is the
-/// environment Claude Code hands its status line. `CLAUDE_HEALTHLINE_COST` =
-/// `show` / `hide` overrides both.
-fn show_cost(input: &Input, env: impl Fn(&str) -> Option<String>) -> bool {
-    match env("CLAUDE_HEALTHLINE_COST").as_deref().map(str::trim) {
-        Some("show") => return true,
-        Some("hide") => return false,
-        _ => {}
+/// environment Claude Code hands its status line, read once into [`Billing`].
+/// `CLAUDE_HEALTHLINE_COST` = `show` / `hide` overrides both.
+fn show_cost(input: &Input, billing: Billing) -> bool {
+    if let Some(forced) = billing.forced {
+        return forced;
     }
     if let Some(rl) = input.rate_limits.as_ref() {
         if rl.five_hour.is_some() || rl.seven_day.is_some() {
@@ -1370,16 +1454,10 @@ fn show_cost(input: &Input, env: impl Fn(&str) -> Option<String>) -> bool {
             return true;
         }
     }
-    let set = |k: &str| env(k).is_some_and(|v| !v.trim().is_empty());
-    let on = |k: &str| env(k).is_some_and(|v| matches!(v.trim(), "1" | "true"));
-    set("ANTHROPIC_API_KEY")
-        || set("ANTHROPIC_AUTH_TOKEN")
-        || on("CLAUDE_CODE_USE_BEDROCK")
-        || on("CLAUDE_CODE_USE_VERTEX")
-        || on("CLAUDE_CODE_USE_FOUNDRY")
+    billing.per_token
 }
 
-fn render(input: &Input, g: &Glyphs) -> String {
+fn collect_segments(input: &Input, g: &Glyphs, config: Config) -> Vec<Seg> {
     let mut segs: Vec<Seg> = Vec::new();
 
     // 0. AGENT HEALTH — headline; highest value, never dropped (only compacted).
@@ -1387,6 +1465,16 @@ fn render(input: &Input, g: &Glyphs) -> String {
         if let Some(hseg) = render_health(&h, g) {
             segs.push(hseg);
         }
+    }
+
+    // 0b. SESSION TITLE — the --name/rename value, else the generated title.
+    if let Some(name) = input
+        .session_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        segs.push(Seg::new("title", BRIGHT_WHITE, g.title, &clean(name, 32)));
     }
 
     // 1. MODEL
@@ -1427,12 +1515,15 @@ fn render(input: &Input, g: &Glyphs) -> String {
         segs.push(Seg::new("repo", DIM, g.repo, &clean(&name, 24)));
     }
 
-    // 4. GIT BRANCH
+    // 4. GIT BRANCH (+ worktree)
     let git_worktree = input
         .workspace
         .as_ref()
         .and_then(|w| w.git_worktree.as_deref());
-    if let Some(branch) = resolve_branch(input.cwd.as_deref(), git_worktree) {
+
+    if config.worktree {
+        segs.extend(worktree::branch_seg(input, g));
+    } else if let Some(branch) = resolve_branch(input.cwd.as_deref(), git_worktree) {
         segs.push(Seg::new(
             "branch",
             DIM_MAGENTA,
@@ -1445,6 +1536,16 @@ fn render(input: &Input, g: &Glyphs) -> String {
     // describes the checkout you are standing in, not the session.
     if let Some(s) = skills_badge(input.cwd.as_deref(), g) {
         segs.push(s);
+    }
+
+    // 4c. PROGRESS, then the goal it is measuring
+    if config.task_line {
+        segs.extend(tasks::task_segs(input.transcript_path.as_deref(), g));
+    }
+
+    // 4d. CURRENT STEP
+    if config.step {
+        segs.extend(tasks::step_seg(input.session_id.as_deref(), g));
     }
 
     // 5. CONTEXT %
@@ -1486,7 +1587,7 @@ fn render(input: &Input, g: &Glyphs) -> String {
     }
 
     // 6. COST — only when the session is billed per token.
-    if show_cost(input, |k| std::env::var(k).ok()) {
+    if show_cost(input, config.billing) {
         let mut cost = input
             .cost
             .as_ref()
@@ -1525,12 +1626,21 @@ fn render(input: &Input, g: &Glyphs) -> String {
             });
         }
         let full_text = parts.join(" \u{00B7} ");
-        let mut cost_seg = Seg::new("cost", DIM_GREEN, g.cost, &full_text);
+        let mut cost_seg = if config.cost_emphasis {
+            emphasised_cost_seg(g, &parts)
+        } else {
+            Seg::new("cost", DIM_GREEN, g.cost, &full_text)
+        };
         if parts.len() > 1 {
+            let color = if config.cost_emphasis {
+                GREEN
+            } else {
+                DIM_GREEN
+            };
             // Narrow terminals collapse the cluster to just the session cost.
             cost_seg.compact = Some((
                 g.cost.chars().count() + 1 + parts[0].chars().count(),
-                seg(DIM_GREEN, g.cost, &parts[0]),
+                seg(color, g.cost, &parts[0]),
             ));
         }
         segs.push(cost_seg);
@@ -1585,7 +1695,55 @@ fn render(input: &Input, g: &Glyphs) -> String {
         });
     }
 
-    fit(segs, &g.sep)
+    segs
+}
+
+/// Splitting on kind (not position) keeps the wide, wrap-prone segments off the
+/// row carrying the numbers; a row's placeholder text holds it open so the status
+/// line does not change height as work starts and stops.
+fn row_specs(rows: usize) -> Vec<(&'static [&'static str], Option<&'static str>)> {
+    match rows {
+        3 => vec![
+            (&["title", "repo", "branch", "skills"], None),
+            (&["progress", "todo", "step"], Some("idle")),
+        ],
+        2 => vec![(
+            &[
+                "title", "repo", "branch", "skills", "progress", "todo", "step",
+            ],
+            None,
+        )],
+        _ => vec![],
+    }
+}
+
+fn layout(segs: Vec<Seg>, g: &Glyphs, rows: usize) -> String {
+    layout_rows(segs, &g.sep, rows)
+}
+
+fn layout_rows(segs: Vec<Seg>, sep: &str, rows: usize) -> String {
+    let specs = row_specs(rows);
+    if specs.is_empty() {
+        return fit(segs, sep);
+    }
+    let mut remaining = segs;
+    let mut lines: Vec<String> = Vec::new();
+    for (kinds, placeholder) in specs {
+        let (row, rest): (Vec<Seg>, Vec<Seg>) =
+            remaining.into_iter().partition(|s| kinds.contains(&s.kind));
+        remaining = rest;
+
+        if !row.is_empty() {
+            lines.push(fit(row, sep));
+        } else if let Some(text) = placeholder {
+            lines.push(seg(DIM, "\u{00B7}", text));
+        }
+    }
+    if !remaining.is_empty() {
+        lines.push(fit(remaining, sep));
+    }
+    lines.retain(|l| !l.trim().is_empty());
+    lines.join("\n")
 }
 
 /// Minimal never-blank fallback used when stdin is empty / not JSON.
@@ -1604,9 +1762,11 @@ fn main() {
         nerd_glyphs()
     };
 
+    let config = Config::from_env();
+
     let line = match serde_json::from_str::<Input>(raw.trim()) {
         Ok(input) => {
-            let rendered = render(&input, &g);
+            let rendered = layout(collect_segments(&input, &g, config), &g, config.rows);
             if rendered.trim().is_empty() {
                 fallback_line(&g)
             } else {
@@ -1655,13 +1815,13 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
-    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-        move |k| {
+    fn env(pairs: &[(&str, &str)]) -> Billing {
+        Billing::from(|k| {
             pairs
                 .iter()
                 .find(|(n, _)| *n == k)
                 .map(|(_, v)| v.to_string())
-        }
+        })
     }
 
     const SUBSCRIBER: &str = r#"{"cost":{"total_cost_usd":0.53},
@@ -1722,7 +1882,13 @@ mod tests {
 
     #[test]
     fn a_subscriber_render_has_no_dollar_sign() {
-        let line = render(&input(SUBSCRIBER), &ascii_glyphs());
+        let g = ascii_glyphs();
+        let config = Config::classic();
+        let line = layout(
+            collect_segments(&input(SUBSCRIBER), &g, config),
+            &g,
+            config.rows,
+        );
         assert!(!line.contains('$'), "{line}");
         assert!(line.contains("5h 28%"), "{line}");
     }
@@ -1861,6 +2027,115 @@ mod tests {
         // compact drops the drift suffix, keeps the core
         let (_, compact) = sg.compact.expect("compact");
         assert!(compact.contains("stab 4.2"));
+    }
+
+    /// Colour codes here were captured from the upstream binary against this
+    /// exact fixture; a brightened palette or a stray segment is the regression
+    /// they pin. The caveman badge and MCP trouble come from files under $HOME,
+    /// so they are left out; billing is forced on so the cost cluster draws.
+    #[test]
+    fn the_default_config_renders_what_upstream_renders() {
+        let raw = r#"{"cwd":"/nonexistent/golden","model":{"display_name":"Opus 5"},"workspace":{"repo":{"name":"my-repo"},"git_worktree":"feature-branch"},"context_window":{"used_percentage":42.0}}"#;
+        let input: Input = serde_json::from_str(raw).expect("fixture parses");
+        let g = nerd_glyphs();
+        let config = Config {
+            billing: Billing {
+                forced: Some(true),
+                per_token: false,
+            },
+            ..Config::classic()
+        };
+
+        let segs: Vec<Seg> = collect_segments(&input, &g, config)
+            .into_iter()
+            .filter(|s| s.kind != "caveman" && s.kind != "mcp")
+            .collect();
+        let rendered: Vec<(&str, String)> =
+            segs.iter().map(|s| (s.kind, s.styled.clone())).collect();
+
+        let kinds: Vec<&str> = rendered.iter().map(|(kind, _)| *kind).collect();
+        assert_eq!(kinds, vec!["model", "repo", "branch", "context", "cost"]);
+
+        let styled = |kind: &str| {
+            rendered
+                .iter()
+                .find(|(k, _)| *k == kind)
+                .map(|(_, s)| s.as_str())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            styled("model"),
+            format!("\x1b[2;36m{} Opus 5\x1b[0m", g.model)
+        );
+        assert_eq!(styled("repo"), format!("\x1b[2m{} my-repo\x1b[0m", g.repo));
+        assert_eq!(
+            styled("branch"),
+            format!("\x1b[2;35m{} feature-branch\x1b[0m", g.branch)
+        );
+        assert_eq!(
+            styled("context"),
+            format!("\x1b[32m{} 42%\x1b[0m", g.context)
+        );
+        // The cost cluster reads $HOME, so only its colour is deterministic.
+        assert!(styled("cost").starts_with("\x1b[2;32m"));
+
+        assert!(!layout(segs, &g, config.rows).contains('\n'));
+    }
+
+    #[test]
+    fn the_default_config_hides_cost_without_a_billing_signal() {
+        let input: Input =
+            serde_json::from_str(r#"{"cost":{"total_cost_usd":0.53}}"#).expect("fixture parses");
+        let segs = collect_segments(&input, &ascii_glyphs(), Config::classic());
+        assert!(segs.iter().all(|s| s.kind != "cost"));
+    }
+
+    #[test]
+    fn rows_group_by_kind_and_hold_their_height() {
+        let g = ascii_glyphs();
+        let build = |kinds: &[&'static str]| -> Vec<Seg> {
+            kinds
+                .iter()
+                .map(|k| Seg::new(k, DIM, k, "x"))
+                .collect::<Vec<_>>()
+        };
+
+        let full = [
+            "title", "model", "repo", "branch", "progress", "todo", "step", "cost",
+        ];
+        let three = layout_rows(build(&full), &g.sep, 3);
+        let lines: Vec<&str> = three.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("\u{1b}[2mtitle"));
+        assert!(lines[0].contains("repo") && lines[0].contains("branch"));
+        // Progress leads its row, ahead of the goal it measures.
+        assert!(lines[1].starts_with("\u{1b}[2mprogress"));
+        assert!(lines[1].contains("todo") && lines[1].contains("step"));
+        assert!(lines[2].contains("model") && lines[2].contains("cost"));
+
+        // No progress, todo or step: the row holds its height with the placeholder.
+        let idle = layout_rows(build(&["model", "repo"]), &g.sep, 3);
+        let idle_lines: Vec<&str> = idle.lines().collect();
+        assert_eq!(idle_lines.len(), 3);
+        assert!(idle_lines[1].contains("idle"));
+
+        // A row with no placeholder still collapses rather than printing blank.
+        let no_repo = layout_rows(build(&["model", "todo"]), &g.sep, 3);
+        assert_eq!(no_repo.lines().count(), 2);
+
+        let one = layout_rows(build(&full), &g.sep, 1);
+        assert_eq!(one.lines().count(), 1);
+    }
+
+    #[test]
+    fn a_bad_session_id_never_reaches_a_path() {
+        assert_eq!(
+            safe_session_id(Some(" abc-123 ")).as_deref(),
+            Some("abc-123")
+        );
+        assert!(safe_session_id(Some("../../etc/passwd")).is_none());
+        assert!(safe_session_id(Some("")).is_none());
+        assert!(safe_session_id(None).is_none());
     }
 
     #[test]
